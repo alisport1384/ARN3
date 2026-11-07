@@ -2,12 +2,11 @@ package com.bigrocket.network
 
 import java.io.IOException
 import java.net.InetAddress
-import java.net.UnknownHostException
-import kotlin.concurrent.thread
-import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.MediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBodyOrNull
+import okhttp3.RequestBody
+import okhttp3.ResponseBody
 
 /**
  * Minimal DNS-over-HTTPS (RFC 8484) client.
@@ -30,7 +29,7 @@ object DohClient {
         .writeTimeout(REQUEST_TIMEOUT_MS, java.util.concurrent.TimeUnit.MILLISECONDS)
         .build()
 
-    private const val DNS_MEDIA_TYPE = "application/dns-message".toMediaTypeOrNull()
+    private val DNS_MEDIA_TYPE = MediaType.get("application/dns-message")
 
     /**
      * Resolves the first IPv4 address reachable through [dohUrl].
@@ -44,7 +43,7 @@ object DohClient {
         val query = buildDnsQuery(DNS_QUERY_DOMAIN)
         val request = Request.Builder()
             .url(dohUrl)
-            .post(query.toRequestBodyOrNull(DNS_MEDIA_TYPE))
+            .post(RequestBody.create(query, DNS_MEDIA_TYPE))
             .header("Accept", "application/dns-message")
             .header("Content-Type", "application/dns-message")
             .build()
@@ -54,7 +53,7 @@ object DohClient {
             response.close()
             throw IOException("DoH endpoint returned HTTP ${response.code}")
         }
-        val bytes = response.body?.bytes() ?: return null
+        val bytes: ByteArray = response.body?.bytes() ?: return null
         response.close()
         return parseFirstARecord(bytes)
     }
