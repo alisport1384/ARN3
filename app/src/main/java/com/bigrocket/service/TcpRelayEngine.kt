@@ -1,0 +1,717 @@
+package com.bigrocket.service
+
+import android.net.Network
+import com.bigrocket.egress.VirtualEgress
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import java.io.FileOutputStream
+import java.io.InputStream
+import java.net.Socket
+import java.nio.ByteBuffer
+import java.util.concurrent.ConcurrentHashMap
+import kotlin.random.Random
+
+// Max app-data bytes per synthetic TCP segment we emit, sized to stay under the VPN
+// interface's declared MTU (1400) including the 20-byte IP + 20-byte TCP headers.
+private const val MAX_TCP_SEGMENT_PAYLOAD = 1360
+
+// Bound on how many not-yet-written upload chunks can queue up per session before the
+// consumer (runSocketWriter) is treated as stuck - see the comment on TcpSession.writeChannel
+// for why this exists at all.
+private const val TCP_WRITE_QUEUE_CAPACITY = 256
+
+// Window-scale shift we announce in our SYN-ACK (window 64240 << 3 ≈ 500 KB). Together with
+// the queue above this lets the client keep a full BDP in flight instead of stopping at 64 KB.
+private const val OUR_WINDOW_SCALE = 3
+
+// MSS we announce: TUN MTU (1400) minus IPv4 (20) and TCP (20) headers.
+private const val OUR_MSS = 1360
+
+// A client SYN that has not produced a session yet is retried by the client every 1-3 s. The
+// guard below is what stops each of those retries from starting ANOTHER outbound connect (the
+// old behaviour: several sockets per flow, fd churn, and a handshake that could complete on a
+// socket nobody was reading). It expires on its own if the connect never returns.
+private const val HANDSHAKE_GUARD_MS = 10_000L
+
+// Read timeout on the relayed socket. A socket whose upstream silently stopped delivering (dead
+// NAT mapping after a radio switch, half-open carrier path) used to block in read() forever, so
+// the client kept waiting on its own retransmit timer while the session looked perfectly alive.
+private const val RELAY_READ_TIMEOUT_MS = 45_000
+private const val RELAY_DEAD_AFTER_IDLE_MS = 120_000L
+
+// Upper bound on unacknowledged bytes per flow, whatever the client advertises: our TUN path is
+// lossless but the app's kernel buffer is finite, so a runaway window would only drop packets.
+private const val MAX_IN_FLIGHT_BYTES = 4L * 1024 * 1024
+
+// One pending upload chunk plus the client-sequence value it advances to once actually
+// written - carried through the channel so ordering/seq-accounting stays correct even though
+// the real write now happens on a different coroutine than the one that received the packet.
+private data class PendingWrite(val payload: ByteArray, val clientNextSeqAfter: Long)
+
+// Fallback window to assume before the client has told us its real one, and the cap on how
+// long we'll wait for the client's window to open before giving up on a stalled peer.
+private const val DEFAULT_CLIENT_WINDOW = 65535
+private const val WINDOW_WAIT_STEP_MS = 20L
+private const val WINDOW_WAIT_MAX_MS = 5000L
+
+// Defensive idle reaper: a well-behaved flow should always close via FIN/RST, but if any edge
+// case ever leaves a session dangling, this guarantees it can't leak forever. Kept fairly short
+// (not e.g. minutes) because each session holds a real OS socket/file-descriptor - a browsing
+// session can easily open 100-300+ distinct TCP connections within a couple of minutes (ads,
+// trackers, images, fonts, each on a different host), and a long idle window means almost none
+// of them get reclaimed during that time, eventually exhausting the process's file-descriptor
+// limit - which shows up as "some connections keep working, new ones just stop" exactly like
+// running low on a shared resource, not a real network problem.
+private const val TCP_REAPER_INTERVAL_MS = 20_000L
+private const val TCP_IDLE_TIMEOUT_MS = 90_000L
+
+// Hard ceiling on concurrent sessions, independent of the idle timeout above - bounds worst-case
+// file-descriptor usage even under a sudden burst of many simultaneous new connections (e.g. a
+// speed-test's "finding optimal server" step opening dozens of probes at once). The least
+// recently active session is evicted to make room, mirroring standard LRU connection-tracking
+// behavior used by real proxies/NAT gateways.
+private const val MAX_CONCURRENT_TCP_SESSIONS = 200
+
+private class TcpSession(
+    val socket: Socket,
+    val network: Network,
+    // Next sequence number this engine will use when sending data/flags to the client.
+    @Volatile var serverSeq: Long,
+    // Next sequence number expected from the client (i.e. the ACK we send).
+    @Volatile var clientNextSeq: Long,
+    // Highest of our own sequence numbers the client has acknowledged so far.
+    @Volatile var clientAckedSeq: Long,
+    // Client's last advertised TCP receive window, in bytes.
+    @Volatile var clientWindow: Int,
+    // Shift the client announced in its SYN; the real window is clientWindow shl scale.
+    @Volatile var clientWindowScale: Int = 0,
+    // The exact SYN/ACK we sent, kept so a retransmitted SYN can be answered without rebuilding.
+    @Volatile var synAck: ByteArray? = null,
+    @Volatile var lastActivityMs: Long = System.currentTimeMillis(),
+    // Upload-direction (client -> remote) bytes are hand off here instead of being written to
+    // the socket directly on the caller's thread. forwardTcpPacket/forwardDataToSocket run on
+    // TunPacketRouter's single TUN-read coroutine, shared by every session on every physical
+    // path. Socket.getOutputStream().write() can legitimately block for seconds when the
+    // underlying path is failing (send buffer full, no ACKs getting through, e.g. Wi-Fi about
+    // to drop) - a blocking write there would stall that one shared coroutine, freezing packet
+    // processing for every other session on every path (including the still-healthy one) until
+    // it times out. Queuing here and doing the real write on this session's own coroutine
+    // (runSocketWriter) confines that risk to one session's own thread.
+    val writeChannel: Channel<PendingWrite> = Channel(TCP_WRITE_QUEUE_CAPACITY)
+)
+
+/**
+ * Relays TCP flows between the local TUN interface and a real Socket connected out over the
+ * chosen physical network. Since the app-side OS TCP stack expects a normal three-way handshake
+ * on the TUN device, this engine performs a minimal but correct handshake (SYN -> SYN/ACK -> ACK)
+ * before relaying payload bytes, keeps sequence/ack numbers consistent in both directions, chunks
+ * outgoing data to fit the interface MTU, and paces writes to never exceed the client's
+ * advertised receive window.
+ *
+ * Because the TUN device is a purely local, in-order, lossless link, respecting the client's
+ * window is sufficient to prevent stalls - there is no real network loss to recover from, so no
+ * retransmission queue is needed as long as we never overrun what the client says it can buffer.
+ *
+ * This is still not a full TCP implementation (no reordering or congestion control), but it is
+ * enough for typical request/response and bulk-download flows such as HTTP(S).
+ */
+class TcpRelayEngine(
+    private val vpnService: BigRocketVpnService
+) {
+
+    // SupervisorJob, not a plain Job: this scope is shared by every TCP session's own
+    // relay coroutine (openSession launches one per connection). With a plain Job, an
+    // uncaught exception in ANY single session's coroutine cancels the whole scope's
+    // Job - which cancels every other session's coroutine too (including ones on the
+    // still-healthy path), AND leaves the scope permanently cancelled so openSession's
+    // future scope.launch{} calls silently no-op forever. That's a full, silent outage
+    // requiring a VPN restart to recover, triggered by one bad connection - this is the
+    // most likely cause of "one path drops -> the whole network is lost". SupervisorJob
+    // makes one session's failure stay contained to that session.
+    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val sessions = ConcurrentHashMap<SessionKey, TcpSession>()
+    private val socketJobs = ConcurrentHashMap<SessionKey, Job>()
+    private val writerJobs = ConcurrentHashMap<SessionKey, Job>()
+    // Flows whose outbound connect is still in progress (see HANDSHAKE_GUARD_MS).
+    private val pendingHandshakes = ConcurrentHashMap<SessionKey, Long>()
+    private var reaperJob: Job? = null
+    @Volatile private var upstreamMode = UpstreamMode.NONE
+    // Set by TunPacketRouter alongside its own tunOutputStream field - see setTunOutputStream().
+    // Needed here so the reaper below can send an RST, same as every other closeSession() path
+    // already does (evictLruSessionIfAtCapacity, handleNetworkLost) - this one was the only
+    // path that didn't, which is exactly what let a stalled session (e.g. the upstream socket
+    // stuck in a read() that will never return - see AetherUpstream.openTcp()'s soTimeout=0)
+    // go completely silent to the client: we'd clean up our own side after
+    // TCP_IDLE_TIMEOUT_MS, but the client app was never told, so it just kept waiting on its
+    // own (often much longer) retransmission timer instead of retrying right away.
+    @Volatile private var reaperTunOutputStream: FileOutputStream? = null
+
+    fun setTunOutputStream(stream: FileOutputStream?) {
+        reaperTunOutputStream = stream
+    }
+
+    init {
+        reaperJob = scope.launch {
+            while (true) {
+                delay(TCP_REAPER_INTERVAL_MS)
+                val now = System.currentTimeMillis()
+                sessions.entries.toList().forEach { (key, session) ->
+                    if (session.socket.isClosed || now - session.lastActivityMs >= TCP_IDLE_TIMEOUT_MS) {
+                        reaperTunOutputStream?.let { sendRst(key, session, it) }
+                        closeSession(key)
+                    }
+                }
+            }
+        }
+    }
+
+    fun setUpstreamMode(mode: UpstreamMode) {
+        if (upstreamMode == mode) return
+        upstreamMode = mode
+        sessions.values.forEach { runCatching { it.socket.close() } }
+        sessions.clear()
+        socketJobs.values.forEach { it.cancel() }
+        socketJobs.clear()
+        writerJobs.values.forEach { it.cancel() }
+        writerJobs.clear()
+    }
+
+    fun forwardTcpPacket(
+        packet: ParsedIpPacket,
+        buffer: ByteBuffer,
+        length: Int,
+        targetNetwork: Network,
+        tunOutputStream: FileOutputStream
+    ) {
+        val key = SessionKey(
+            protocol = packet.protocol,
+            sourceIp = packet.sourceIp,
+            sourcePort = packet.sourcePort,
+            destinationIp = packet.destinationIp,
+            destinationPort = packet.destinationPort
+        )
+
+        val flags = packet.tcpFlags
+        val existing = sessions[key]
+
+        if (flags and TcpFlag.RST != 0) {
+            closeSession(key)
+            return
+        }
+
+        if (existing == null) {
+            // Only a fresh SYN (without ACK) may open a new session.
+            if (flags and TcpFlag.SYN != 0 && flags and TcpFlag.ACK == 0) {
+                // The client retransmits SYN every 1-3 s until it sees a SYN/ACK. If the first
+                // connect is still running, that retransmission must NOT start a second one.
+                val startedAt = pendingHandshakes[key]
+                if (startedAt != null && System.currentTimeMillis() - startedAt < HANDSHAKE_GUARD_MS) {
+                    return
+                }
+                pendingHandshakes[key] = System.currentTimeMillis()
+                openSession(key, packet, targetNetwork, tunOutputStream)
+            } else if (flags and TcpFlag.RST == 0) {
+                // Data/ACK for a flow we no longer track (reaped, evicted, or never opened).
+                // Silence here is what turns into a multi-second "connection just hangs" wait:
+                // the app would keep retransmitting until its own timers expire. A RST makes it
+                // fail and retry at once, exactly like a real gateway.
+                sendRst(key, ack = packet.tcpSeq + packet.dataLength, tunOutputStream, seq = packet.tcpAck)
+            }
+            return
+        }
+
+        // The client never received our SYN/ACK (lost write, or the session was just created
+        // after its retransmit): re-send the cached one instead of ignoring the SYN, which left
+        // the handshake unfinished and the connection permanently "connecting".
+        if (flags and TcpFlag.SYN != 0 && flags and TcpFlag.ACK == 0) {
+            existing.synAck?.let { cached ->
+                runCatching { synchronized(tunOutputStream) { tunOutputStream.write(cached); tunOutputStream.flush() } }
+                AppLogger.log("Direct-TCP", "SYN retransmit answered for ${key.destinationIp}:${key.destinationPort}")
+            }
+            return
+        }
+
+        // Every packet from the client tells us how much of our data it has received and how
+        // much more it can currently buffer - the response loop uses this to pace itself.
+        if (flags and TcpFlag.ACK != 0 && packet.tcpAck > existing.clientAckedSeq) {
+            existing.clientAckedSeq = packet.tcpAck
+        }
+        existing.clientWindow = packet.tcpWindow
+        existing.lastActivityMs = System.currentTimeMillis()
+
+        if (packet.dataLength > 0) {
+            val payload = ByteArray(packet.dataLength)
+            buffer.position(packet.dataOffset)
+            buffer.get(payload, 0, packet.dataLength)
+            forwardDataToSocket(key, existing, payload, packet, tunOutputStream)
+        }
+
+        if (flags and TcpFlag.FIN != 0) {
+            existing.clientNextSeq = packet.tcpSeq + packet.dataLength + 1
+            sendAck(key, existing, tunOutputStream)
+            try {
+                existing.socket.shutdownOutput()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    private fun openSession(
+        key: SessionKey,
+        synPacket: ParsedIpPacket,
+        targetNetwork: Network,
+        tunOutputStream: FileOutputStream
+    ) {
+        scope.launch {
+            var socket: Socket? = null
+            try {
+                evictLruSessionIfAtCapacity(tunOutputStream)
+
+                socket = when (upstreamMode) {
+                    UpstreamMode.AETHER -> AetherUpstream.openTcp(
+                        vpnService = vpnService,
+                        destinationHost = key.destinationIp,
+                        destinationPort = key.destinationPort,
+                    )
+                    UpstreamMode.XRAY -> AetherUpstream.openTcp(
+                        vpnService = vpnService,
+                        destinationHost = key.destinationIp,
+                        destinationPort = key.destinationPort,
+                        proxyPort = EmbeddedXrayRuntime.SOCKS_PORT,
+                    )
+                    UpstreamMode.NONE -> {
+                        // Direct mode still ends at ONE egress object: if the user has set a
+                        // static-IP proxy, VirtualEgress tunnels this connection through it
+                        // (bound to targetNetwork + protect()ed, so the proxy hop itself still
+                        // rides Path 1/Path 2) and the connection is otherwise identical.
+                        VirtualEgress.connectTcp(
+                            vpnService = vpnService,
+                            network = targetNetwork,
+                            destHost = key.destinationIp,
+                            destPort = key.destinationPort,
+                            connectTimeoutMs = 4000,
+                            label = "direct-tcp",
+                        )
+                    }
+                }
+
+                val serverIsn = Random.nextLong(0, 0xFFFFFFFL)
+                val session = TcpSession(
+                    socket = socket,
+                    network = targetNetwork,
+                    serverSeq = serverIsn + 1, // SYN consumes one sequence number
+                    clientNextSeq = synPacket.tcpSeq + 1,
+                    clientAckedSeq = serverIsn + 1,
+                    clientWindow = if (synPacket.tcpWindow > 0) synPacket.tcpWindow else DEFAULT_CLIENT_WINDOW
+                )
+                sessions[key] = session
+                // One flow = one path for its lifetime, so this is the real aggregation unit.
+                PathTrafficStats.flowOpened(PathLabels.of(targetNetwork))
+
+                // Liveness: bound the very first read. A relayed socket that stays blocked in
+                // read() forever is indistinguishable from a working one until the app gives up.
+                runCatching { session.socket.soTimeout = RELAY_READ_TIMEOUT_MS }
+
+                session.clientWindowScale = synPacket.tcpWindowScale
+
+                // Reply with SYN/ACK to complete the handshake with the local TCP stack. The
+                // options are what a real gateway announces - see TcpOptions for why omitting
+                // them capped both directions at 64 KB in flight.
+                val synAck = IpPacketBuilder.buildTcpResponsePacket(
+                    srcIp = key.destinationIp,
+                    srcPort = key.destinationPort,
+                    dstIp = key.sourceIp,
+                    dstPort = key.sourcePort,
+                    seqNumber = serverIsn,
+                    ackNumber = session.clientNextSeq,
+                    flags = TcpFlag.SYN or TcpFlag.ACK,
+                    data = ByteArray(0),
+                    dataLength = 0,
+                    options = TcpOptions.synAckOptions(OUR_MSS, OUR_WINDOW_SCALE),
+                    windowSize = TcpOptions.DEFAULT_WINDOW,
+                )
+                session.synAck = synAck
+                synchronized(tunOutputStream) {
+                    tunOutputStream.write(synAck)
+                    tunOutputStream.flush()
+                }
+
+                val job = launch { listenForTcpResponses(key, session, tunOutputStream) }
+                socketJobs[key] = job
+                writerJobs[key] = launch { runSocketWriter(key, session, tunOutputStream) }
+            } catch (e: Exception) {
+                AppLogger.logError(
+                    "Direct-TCP",
+                    "openSession failed ${key.destinationIp}:${key.destinationPort}",
+                    e
+                )
+                try {
+                    val rst = IpPacketBuilder.buildTcpResponsePacket(
+                        srcIp = key.destinationIp,
+                        srcPort = key.destinationPort,
+                        dstIp = key.sourceIp,
+                        dstPort = key.sourcePort,
+                        seqNumber = 0L,
+                        ackNumber = synPacket.tcpSeq + 1,
+                        flags = TcpFlag.RST or TcpFlag.ACK,
+                        data = ByteArray(0),
+                        dataLength = 0
+                    )
+                    synchronized(tunOutputStream) {
+                        tunOutputStream.write(rst)
+                        tunOutputStream.flush()
+                    }
+                } catch (_: Exception) {
+                }
+                socket?.let { try { it.close() } catch (_: Exception) {} }
+                sessions.remove(key)
+            } finally {
+                pendingHandshakes.remove(key)
+            }
+        }
+    }
+
+    private fun forwardDataToSocket(
+        key: SessionKey,
+        session: TcpSession,
+        payload: ByteArray,
+        packet: ParsedIpPacket,
+        tunOutputStream: FileOutputStream
+    ) {
+        // Must not call session.socket's blocking write() here: this function runs on
+        // TunPacketRouter's single shared TUN-read coroutine (see the comment on
+        // TcpSession.writeChannel). Handing the payload to the queue and returning
+        // immediately is what keeps one struggling path from freezing every other flow.
+        val pending = PendingWrite(payload, packet.tcpSeq + payload.size)
+        val result = session.writeChannel.trySend(pending)
+        if (result.isFailure) {
+            // Queue is full, meaning runSocketWriter's actual write() has been stuck for
+            // TCP_WRITE_QUEUE_CAPACITY chunks already - treat that exactly like a hard write
+            // failure (below) rather than blocking here waiting for room to free up.
+            closeSession(key)
+        }
+    }
+
+    /**
+     * Drains one session's upload queue and performs the real (possibly blocking) socket
+     * write on this session's own coroutine, off TunPacketRouter's shared TUN-read thread -
+     * see the comment on TcpSession.writeChannel for why this split exists. Sequence
+     * accounting and the client ACK are only advanced/sent once a chunk is actually written,
+     * preserving the original synchronous behavior's semantics.
+     */
+    private suspend fun runSocketWriter(key: SessionKey, session: TcpSession, tunOutputStream: FileOutputStream) {
+        try {
+            val outStream = session.socket.getOutputStream()
+            for (pending in session.writeChannel) {
+                outStream.write(pending.payload)
+                outStream.flush()
+                session.clientNextSeq = pending.clientNextSeqAfter
+                session.lastActivityMs = System.currentTimeMillis()
+                TrafficStats.recordBytes(pending.payload.size)
+                // Real measurement for the aggregation balancer: this many payload bytes
+                // actually left through this session's radio just now.
+                PathTrafficStats.recordBytes(PathLabels.of(session.network), pending.payload.size)
+                if (upstreamMode == UpstreamMode.NONE) PathActivityMonitor.recordActivity(session.network)
+                sendAck(key, session, tunOutputStream)
+            }
+        } catch (_: Exception) {
+            // Real write failure (socket dead/reset) - tear the session down like before.
+        } finally {
+            closeSession(key)
+        }
+    }
+
+    /**
+     * Bytes we may still send before the client's advertised window is exhausted.
+     *
+     * Uses the client's REAL window: `window shl scale`, from the shift it announced in its SYN.
+     * The previous version used the raw 16-bit field, which silently capped every flow at 64 KB
+     * in flight - a hard ceiling of ~1.3 MB/s at 40 ms RTT no matter how fast the radio was.
+     */
+    private fun inFlightBudget(session: TcpSession): Long {
+        val scale = session.clientWindowScale.coerceIn(0, 14)
+        val window = (session.clientWindow.toLong() and 0xFFFFL) shl scale
+        val usable = window.coerceIn(0L, MAX_IN_FLIGHT_BYTES)
+        return (session.clientAckedSeq + usable) - session.serverSeq
+    }
+
+    private fun sendAck(key: SessionKey, session: TcpSession, tunOutputStream: FileOutputStream) {
+        try {
+            val ackPacket = IpPacketBuilder.buildTcpResponsePacket(
+                srcIp = key.destinationIp,
+                srcPort = key.destinationPort,
+                dstIp = key.sourceIp,
+                dstPort = key.sourcePort,
+                seqNumber = session.serverSeq,
+                ackNumber = session.clientNextSeq,
+                flags = TcpFlag.ACK,
+                data = ByteArray(0),
+                dataLength = 0
+            )
+            synchronized(tunOutputStream) {
+                tunOutputStream.write(ackPacket)
+                tunOutputStream.flush()
+            }
+        } catch (_: Exception) {
+        }
+    }
+
+    private suspend fun listenForTcpResponses(
+        key: SessionKey,
+        session: TcpSession,
+        tunOutputStream: FileOutputStream
+    ) {
+        val rxBuffer = ByteArray(16384)
+        try {
+            val inStream: InputStream = session.socket.getInputStream()
+            var idleDeadlineMs = System.currentTimeMillis() + RELAY_DEAD_AFTER_IDLE_MS
+            while (!session.socket.isClosed) {
+                val readBytes = try {
+                    inStream.read(rxBuffer)
+                } catch (timeout: java.net.SocketTimeoutException) {
+                    idleDeadlineMs = handleReadTimeout(key, session, idleDeadlineMs, tunOutputStream) ?: break
+                    continue
+                }
+                if (readBytes > 0) {
+                    if (!writeChunkedRespectingWindow(key, session, rxBuffer, readBytes, tunOutputStream)) {
+                        // The client's window never opened up in time (stalled/dead peer); give up.
+                        break
+                    }
+                } else if (readBytes == -1) {
+                    val finPacket = IpPacketBuilder.buildTcpResponsePacket(
+                        srcIp = key.destinationIp,
+                        srcPort = key.destinationPort,
+                        dstIp = key.sourceIp,
+                        dstPort = key.sourcePort,
+                        seqNumber = session.serverSeq,
+                        ackNumber = session.clientNextSeq,
+                        flags = TcpFlag.FIN or TcpFlag.ACK,
+                        data = ByteArray(0),
+                        dataLength = 0
+                    )
+                    synchronized(tunOutputStream) {
+                        tunOutputStream.write(finPacket)
+                        tunOutputStream.flush()
+                    }
+                    session.serverSeq += 1
+                    break
+                }
+            }
+        } catch (_: Exception) {
+            // Socket closed or errored; tear down the session
+        } finally {
+            closeSession(key)
+        }
+    }
+
+    /**
+     * Called when the relayed socket produced nothing for [RELAY_READ_TIMEOUT_MS].
+     *
+     * Two cases, and telling them apart is what turns "the connection silently died" into either
+     * "it keeps working" or "the app is told at once":
+     *
+     *  - The client is still talking on this flow (it sent data or ACKs recently) or it is a
+     *    long-lived idle connection (websocket, SSH, IM push): the upstream is simply quiet, so
+     *    we keep waiting and push the deadline out.
+     *  - Nothing at all has happened on the flow for [RELAY_DEAD_AFTER_IDLE_MS]: the upstream is
+     *    almost certainly gone (dead NAT mapping after a radio switch, half-open carrier path).
+     *    Waiting longer only delays the app's own recovery, so we RST the client and free the
+     *    session - the app reconnects immediately instead of hanging for minutes.
+     *
+     * @return the new idle deadline, or null when the session must be torn down.
+     */
+    private fun handleReadTimeout(
+        key: SessionKey,
+        session: TcpSession,
+        idleDeadlineMs: Long,
+        tunOutputStream: FileOutputStream,
+    ): Long? {
+        val now = System.currentTimeMillis()
+        val clientRecentlyActive = now - session.lastActivityMs < RELAY_DEAD_AFTER_IDLE_MS
+        if (clientRecentlyActive || now < idleDeadlineMs) {
+            // Quiet but not dead: extend (a bounded number of times, so a permanently silent
+            // socket cannot keep a file descriptor forever).
+            return maxOf(idleDeadlineMs, now + RELAY_READ_TIMEOUT_MS)
+        }
+        AppLogger.log(
+            "Direct-TCP",
+            "relayed socket silent for ${RELAY_DEAD_AFTER_IDLE_MS}ms - RST to client for " +
+                "${key.destinationIp}:${key.destinationPort}",
+        )
+        sendRst(key, session, tunOutputStream)
+        return null
+    }
+
+    /**
+     * Writes [readBytes] from [rxBuffer] to the TUN device as one or more MTU-sized TCP
+     * segments, never sending more unacknowledged data than the client's advertised receive
+     * window allows. Returns false if the client's window stayed closed past [WINDOW_WAIT_MAX_MS].
+     */
+    private suspend fun writeChunkedRespectingWindow(
+        key: SessionKey,
+        session: TcpSession,
+        rxBuffer: ByteArray,
+        readBytes: Int,
+        tunOutputStream: FileOutputStream
+    ): Boolean {
+        var offset = 0
+        while (offset < readBytes) {
+            var waitedMs = 0L
+            var allowed = inFlightBudget(session)
+            while (allowed <= 0) {
+                if (waitedMs >= WINDOW_WAIT_MAX_MS) return false
+                delay(WINDOW_WAIT_STEP_MS)
+                waitedMs += WINDOW_WAIT_STEP_MS
+                allowed = inFlightBudget(session)
+            }
+
+            val chunkSize = minOf(
+                MAX_TCP_SEGMENT_PAYLOAD,
+                readBytes - offset,
+                allowed.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+            )
+            if (chunkSize <= 0) continue
+
+            val responseBytes = IpPacketBuilder.buildTcpResponsePacket(
+                srcIp = key.destinationIp,
+                srcPort = key.destinationPort,
+                dstIp = key.sourceIp,
+                dstPort = key.sourcePort,
+                seqNumber = session.serverSeq,
+                ackNumber = session.clientNextSeq,
+                flags = TcpFlag.PSH or TcpFlag.ACK,
+                data = rxBuffer,
+                dataLength = chunkSize,
+                dataOffset = offset
+            )
+
+            synchronized(tunOutputStream) {
+                tunOutputStream.write(responseBytes)
+                tunOutputStream.flush()
+            }
+
+            session.serverSeq += chunkSize
+            TrafficStats.recordBytes(chunkSize)
+            PathTrafficStats.recordBytes(PathLabels.of(session.network), chunkSize)
+            if (upstreamMode == UpstreamMode.NONE) PathActivityMonitor.recordActivity(session.network)
+            session.lastActivityMs = System.currentTimeMillis()
+            offset += chunkSize
+        }
+        return true
+    }
+
+    private fun closeSession(key: SessionKey) {
+        socketJobs.remove(key)?.cancel()
+        writerJobs.remove(key)?.cancel()
+        sessions.remove(key)?.let {
+            it.writeChannel.close()
+            PathTrafficStats.flowClosed(PathLabels.of(it.network))
+            try { it.socket.close() } catch (_: Exception) {}
+        }
+    }
+
+    /**
+     * Bounds worst-case file-descriptor usage regardless of idle-timeout tuning: if we're
+     * already at the concurrent-session ceiling, make room by closing the single
+     * least-recently-active session (with an RST so its client notices immediately and can
+     * retry) before opening a new one. A linear scan over at most MAX_CONCURRENT_TCP_SESSIONS
+     * entries is negligible - this only runs when opening a brand new session, not per packet.
+     */
+    /**
+     * Tells the client app's own TCP stack a flow is dead, instead of leaving it to silently
+     * wait out its own retransmission/keepalive timer (which can run for minutes) - see
+     * handleNetworkLost's doc comment, which this now shares its implementation with. Used
+     * for every path that tears a session down for a reason the CLIENT could not otherwise
+     * detect itself: capacity eviction, a lost physical network, and (see the reaper in init{})
+     * a session the idle timeout gave up on.
+     */
+    /** RST for a flow that has no session (reaped/evicted/never opened) - see forwardTcpPacket. */
+    private fun sendRst(key: SessionKey, ack: Long, tunOutputStream: FileOutputStream, seq: Long = 0L) {
+        try {
+            val rst = IpPacketBuilder.buildTcpResponsePacket(
+                srcIp = key.destinationIp,
+                srcPort = key.destinationPort,
+                dstIp = key.sourceIp,
+                dstPort = key.sourcePort,
+                seqNumber = seq,
+                ackNumber = ack,
+                flags = TcpFlag.RST or TcpFlag.ACK,
+                data = ByteArray(0),
+                dataLength = 0,
+            )
+            synchronized(tunOutputStream) {
+                tunOutputStream.write(rst)
+                tunOutputStream.flush()
+            }
+            AppLogger.log("Direct-TCP", "RST for untracked flow ${key.destinationIp}:${key.destinationPort} (client retries immediately)")
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun sendRst(key: SessionKey, session: TcpSession, tunOutputStream: FileOutputStream) {
+        try {
+            val rst = IpPacketBuilder.buildTcpResponsePacket(
+                srcIp = key.destinationIp,
+                srcPort = key.destinationPort,
+                dstIp = key.sourceIp,
+                dstPort = key.sourcePort,
+                seqNumber = session.serverSeq,
+                ackNumber = session.clientNextSeq,
+                flags = TcpFlag.RST or TcpFlag.ACK,
+                data = ByteArray(0),
+                dataLength = 0
+            )
+            synchronized(tunOutputStream) {
+                tunOutputStream.write(rst)
+                tunOutputStream.flush()
+            }
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun evictLruSessionIfAtCapacity(tunOutputStream: FileOutputStream) {
+        if (sessions.size < MAX_CONCURRENT_TCP_SESSIONS) return
+
+        val oldest = sessions.entries.minByOrNull { it.value.lastActivityMs } ?: return
+        val key = oldest.key
+        val session = oldest.value
+        sendRst(key, session, tunOutputStream)
+        closeSession(key)
+    }
+
+    /**
+     * Called when a physical network genuinely goes away (Android's own onLost, not just a
+     * momentary latency blip). Any session still pinned to that network can never recover its
+     * real backing socket - it was bound to that specific network and can't be silently
+     * re-bound - so without this, the client app would just see silence and have to wait out
+     * its own TCP retransmission/keepalive timeout (often tens of seconds) before giving up and
+     * retrying. Sending an immediate RST lets the client notice right away and retry, which
+     * (thanks to session-selection already excluding the dead network) lands on the surviving
+     * path within moments instead of the connection appearing to hang.
+     */
+    fun handleNetworkLost(deadNetwork: Network, tunOutputStream: FileOutputStream) {
+        sessions.entries.toList().forEach { (key, session) ->
+            if (session.network != deadNetwork) return@forEach
+            sendRst(key, session, tunOutputStream)
+            closeSession(key)
+        }
+    }
+
+    fun clear() {
+        reaperJob?.cancel()
+        socketJobs.values.forEach { it.cancel() }
+        socketJobs.clear()
+        writerJobs.values.forEach { it.cancel() }
+        writerJobs.clear()
+        sessions.values.forEach { session ->
+            session.writeChannel.close()
+            try { session.socket.close() } catch (_: Exception) {}
+        }
+        sessions.clear()
+    }
+}

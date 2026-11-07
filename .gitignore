@@ -1,0 +1,16 @@
+# Gradle / build outputs
+.gradle/
+.kotlin/
+build/
+app/build/
+local.properties
+*.iml
+.idea/
+captures/
+
+# Native engines are produced by scripts/build-natives.sh + scripts/build-xray.sh
+app/src/main/jniLibs/
+app/src/main/assets/aether/
+
+# Fetched/staged by scripts/fetch-natives.sh in CI
+app/src/main/assets/server_entries.txt
