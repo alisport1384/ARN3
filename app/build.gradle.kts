@@ -19,6 +19,10 @@ android {
         multiDexEnabled = true
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        ndk {
+            abiFilters.addAll(listOf("arm64-v8a", "armeabi-v7a"))
+        }
     }
 
     buildTypes {
@@ -34,10 +38,6 @@ android {
         isCoreLibraryDesugaringEnabled = true
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
-    }
-    // Ship only the two ABIs the native cores are built for: arm64-v8a and armeabi-v7a.
-    ndk {
-        abiFilters.addAll(listOf("arm64-v8a", "armeabi-v7a"))
     }
     // AGP 9's built-in Kotlin support derives the Kotlin JVM target from
     // compileOptions above - the old kotlinOptions{} DSL no longer exists
