@@ -3,7 +3,7 @@ package com.bigrocket.network
 import android.content.Context
 import java.io.IOException
 import java.net.InetAddress
-import kotlin.concurrent.withTimeout
+import kotlinx.coroutines.withTimeout
 
 /**
  * Resolves a user-supplied [DnsConfig] to a concrete IPv4 address that can be handed
@@ -44,8 +44,10 @@ object DnsResolver {
     /**
      * Resolves [config] with a hard timeout so VPN startup is never blocked by a
      * slow or dead DoH endpoint. Falls back to null (defaults) on any failure.
+     *
+     * Must be called from a coroutine (suspend context).
      */
-    fun resolveToIpSafe(context: Context, config: DnsConfig, timeoutMs: Long = 6_000L): String? {
+    suspend fun resolveToIpSafe(context: Context, config: DnsConfig, timeoutMs: Long = 6_000L): String? {
         return runCatching {
             withTimeout(timeoutMs) {
                 resolveToIp(context, config)
