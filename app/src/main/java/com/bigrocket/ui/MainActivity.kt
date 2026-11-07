@@ -41,6 +41,8 @@ import com.bigrocket.egress.StaticProxyRuntime
 import com.bigrocket.egress.StaticProxyStore
 import com.bigrocket.config.ConfigParseException
 import com.bigrocket.config.SubscriptionFetcher
+import com.bigrocket.network.DnsConfig
+import com.bigrocket.network.DnsConfigStore
 import com.bigrocket.service.EmbeddedAetherRuntime
 import com.bigrocket.service.PsiphonHop
 import com.bigrocket.service.UpstreamHealth
@@ -107,6 +109,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnClearStaticProxy: Button
     private lateinit var btnCheckEgressIp: Button
     private lateinit var tvStaticProxyStatus: TextView
+    // DNS address: replaces hardcoded static DNS servers.
+    private lateinit var etDnsAddress: android.widget.EditText
+    private lateinit var btnSaveDnsAddress: Button
     private lateinit var tvEgressIp: TextView
     private var upstreamChoice = UpstreamChoice.NONE
     // Backed by Compose state (not a plain var): AetherEmbeddedPanel reads this inside
@@ -237,7 +242,10 @@ class MainActivity : AppCompatActivity() {
         btnCheckEgressIp = findViewById(R.id.btnCheckEgressIp)
         tvStaticProxyStatus = findViewById(R.id.tvStaticProxyStatus)
         tvEgressIp = findViewById(R.id.tvEgressIp)
+        etDnsAddress = findViewById(R.id.etDnsAddress)
+        btnSaveDnsAddress = findViewById(R.id.btnSaveDnsAddress)
         setupStaticProxyControls()
+        setupDnsControls()
     }
 
     /**
@@ -392,6 +400,40 @@ class MainActivity : AppCompatActivity() {
                 AppLogger.log("UI", "auto port detection failed: $message")
                 Toast.makeText(this@MainActivity, message, Toast.LENGTH_LONG).show()
             }
+        }
+    }
+
+    /** DNS address card: replaces hardcoded static DNS servers. Plain IP or DoH URL. */
+    private fun setupDnsControls() {
+        val stored = DnsConfigStore.read(this)
+        val text = when (stored) {
+            is DnsConfig.PlainIp -> stored.ip
+            is DnsConfig.DohUrl -> stored.url
+            DnsConfig.None -> ""
+        }
+        etDnsAddress.setText(text)
+
+        btnSaveDnsAddress.setOnClickListener {
+            val raw = etDnsAddress.text?.toString()?.trim().orEmpty()
+            val config = DnsConfig.parse(raw)
+            try {
+                DnsConfigStore.save(this, config)
+            } catch (e: Exception) {
+                AppLogger.log("UI", "dns save failed: ${e.javaClass.simpleName}")
+                Toast.makeText(this, "ذخیره دی ان اس ناموفق بود", Toast.LENGTH_LONG).show()
+                return@setOnClickListener
+            }
+            val desc = when (config) {
+                is DnsConfig.PlainIp -> "آی‌پی: ${config.ip}"
+                is DnsConfig.DohUrl -> "دی‌اوچ‌ی: ${config.url}"
+                DnsConfig.None -> "پیش‌فرض هسته"
+            }
+            AppLogger.log("UI", "dns saved: $desc")
+            Toast.makeText(
+                this,
+                "ذخیره شد: $desc — از اتصال بعدی اعمال می‌شود",
+                Toast.LENGTH_SHORT,
+            ).show()
         }
     }
 

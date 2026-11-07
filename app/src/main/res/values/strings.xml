@@ -187,6 +187,9 @@
     <string name="dns_label">DNS inside the tunnel</string>
     <string name="dns_hint">1.1.1.1, 1.0.0.1</string>
     <string name="dns_help">Leave empty for the engine default (1.1.1.1, 1.0.0.1). Invalid entries are ignored.</string>
+    <string name="dns_user_label">DNS address (replaces static IP)</string>
+    <string name="dns_user_hint">188.114.99.0 or https://8.8.8.8/dns-query</string>
+    <string name="dns_user_help">Enter a plain IP (e.g. 188.114.99.0) or a DNS-over-HTTPS URL (e.g. https://8.8.8.8/dns-query). It will be resolved to an IP and used instead of the static DNS servers.</string>
     <!-- Feature merge: home-screen widget, onboarding, ping, crash report -->
     <string name="widget_desc">Connect or disconnect Aether with one tap</string>
     <string name="widget_toggle_desc">Toggle connection</string>

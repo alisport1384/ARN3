@@ -20,6 +20,9 @@ import com.bigrocket.egress.StaticProxyStore
 import com.bigrocket.egress.VirtualEgress
 import com.bigrocket.ui.MainActivity
 import com.bigrocket.bonding.sandbox.VirtualBondingSandbox
+import com.bigrocket.network.DnsConfig
+import com.bigrocket.network.DnsConfigStore
+import com.bigrocket.network.DnsResolver
 import studio.cluvex.aether.core.AetherController
 import studio.cluvex.aether.data.ProfileStore
 import studio.cluvex.aether.model.ConnectionProfile
@@ -702,9 +705,18 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
                 .setSession("BigRocketVPN")
                 .addAddress("10.0.0.2", 24)
                 .addRoute("0.0.0.0", 0)
-                .addDnsServer("8.8.8.8")
-                .addDnsServer("1.1.1.1")
                 .setMtu(1400)
+
+                // User-configured DNS replaces the hardcoded static servers.
+                // A plain IPv4 is used directly; a DoH URL is resolved via RFC 8484.
+                // Any failure falls back to the engine default (1.1.1.1).
+                val userDns = DnsConfigStore.read(this@BigRocketVpnService)
+                val resolvedIp = DnsResolver.resolveToIpSafe(this@BigRocketVpnService, userDns)
+                if (resolvedIp != null) {
+                    builder.addDnsServer(resolvedIp)
+                } else {
+                    builder.addDnsServer("1.1.1.1")
+                }
 
             try {
                 builder.addDisallowedApplication(packageName)
