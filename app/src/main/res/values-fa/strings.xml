@@ -266,4 +266,14 @@
     <string name="upstream_help">اتصال را از دل پراکسی‌ای که همین حالا روی گوشی اجراست بیرون می‌برد. آدرس socks5://host:port همهٔ پروتکل‌ها را حمل می‌کند؛ http://host:port فقط MASQUE روی HTTP/2 را که خودِ برنامه برایتان فعال می‌کند. نام کاربری و گذرواژه را می‌توانید به شکل user:pass@host:port بنویسید؛ این مقدار به‌صورت محرمانه به موتور داده می‌شود و هرگز در خط فرمان آن قرار نمی‌گیرد. برای اتصال مستقیم خالی بگذارید.</string>
     <string name="reprovision_title">جایگزینی شناسهٔ ردشده</string>
     <string name="reprovision_desc">اگر کلادفلر شناسهٔ ذخیره‌شدهٔ دستگاه را نپذیرد، به‌جای نگه‌داشتن تونلی که وصل می‌شود اما ترافیکی عبور نمی‌دهد، به‌صورت خودکار شناسهٔ تازه ثبت می‌کند.</string>
+    <!-- تونل آدرسی (موتور ۲، ادغام درون گوشی) -->
+    <string name="address_tunnel_title">تونل آدرسی (موتور ۲ در گوشی)</string>
+    <string name="address_tunnel_help">فقط یک آدرس وارد کنید: آی‌پی ساده (مثلاً ۲۰۳٫۰٫۱۱۳٫۹)، یک نام دی‌ان‌اس، یا اندپوینت DoH (https://host/dns-query). لازم نیست چیزی روی پورت ۱۰۸۰/۸۰۸۰ اجرا شود؛ آدرس فقط می‌گوید کانال ادغام‌شده کجا برود. برنامه اول آن را تست می‌کند؛ اگر جواب نداد، به پروکسی استاتیک یا خروجی مستقیم پایین برمی‌گردد.</string>
+    <string name="address_tunnel_hint">203.0.113.9 یا bridge.example.org یا https://host/dns-query</string>
+    <string name="address_tunnel_save">تست و ذخیره</string>
+    <string name="address_tunnel_clear">حذف</string>
+    <string name="address_tunnel_off">تونل آدرسی: خاموش — موتور ۱ / خروجی مستقیم</string>
+    <string name="address_tunnel_testing">در حال تست آدرس (HELLO + PING)…</string>
+    <string name="address_tunnel_ok">تونل آدرسی: فعال و تأییدشده</string>
+    <string name="address_tunnel_failed">تونل آدرسی: ناموفق — برگشت به موتور ۱ / مستقیم</string>
 </resources>

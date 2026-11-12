@@ -3,6 +3,7 @@ package com.bigrocket.egress
 import android.net.Network
 import android.net.VpnService
 import com.bigrocket.service.AppLogger
+import com.bigrocket.tunnel.AddressTunnelRuntime
 import java.io.IOException
 import java.net.DatagramPacket
 import java.net.DatagramSocket
@@ -76,7 +77,11 @@ object VirtualEgress {
     fun isEnabled(): Boolean = StaticProxyRuntime.config != null
 
     /** One-line description used in logs and the status card. */
-    fun describe(): String = StaticProxyRuntime.config?.let { "static-proxy ${it.describe()}" } ?: "direct"
+    fun describe(): String = when {
+        StaticProxyRuntime.config != null -> "static-proxy ${StaticProxyRuntime.config?.describe()}"
+        AddressTunnelRuntime.isReady() -> "address-tunnel ${AddressTunnelRuntime.currentSpec()?.endpointLabel()}"
+        else -> "direct"
+    }
 
     /**
      * Opens a TCP connection to [destHost]:[destPort] over [network].
@@ -93,6 +98,18 @@ object VirtualEgress {
         connectTimeoutMs: Int = CONNECT_TIMEOUT_MS,
         label: String = "",
     ): Socket {
+        // ENGINE 2 FIRST (docs/AddressTunnel.md): when the user mounted an address and it passed
+        // its self-test, every flow is multiplexed into that one channel instead of dialling a
+        // proxy per flow. `null` means "not ready / it just failed", and the historical path
+        // below runs untouched - that is the fallback rule the user asked for.
+        if (AddressTunnelRuntime.isReady()) {
+            val tunnelled = AddressTunnelRuntime.openTcp(destHost, destPort)
+            if (tunnelled != null) {
+                AppLogger.log("Egress", "engine 2 -> $destHost:$destPort over the address tunnel ($label)")
+                return tunnelled
+            }
+            AppLogger.log("Egress", "engine 2 open failed for $destHost:$destPort - falling back")
+        }
         val configured = StaticProxyRuntime.config
         if (configured == null) {
             return connectDirect(vpnService, network, destHost, destPort, connectTimeoutMs, label)
@@ -213,6 +230,12 @@ object VirtualEgress {
      * - SOCKS5 proxy: UDP ASSOCIATE, so the datagrams leave from the proxy's address too.
      */
     fun openUdpChannel(vpnService: VpnService, network: Network, label: String = ""): EgressUdpChannel {
+        // Same rule for datagrams: one DGRAM pseudo-stream carries every UDP flow, the far side
+        // does the real sends, and the reply arrives as DGRAM_RX. A null return means fall back.
+        if (AddressTunnelRuntime.isReady()) {
+            val tunnelled = AddressTunnelRuntime.openUdpChannel()
+            if (tunnelled != null) return tunnelled
+        }
         val configured = StaticProxyRuntime.config
         if (configured == null) {
             return DirectUdpChannel(vpnService, network)

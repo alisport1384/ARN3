@@ -17,7 +17,11 @@ import android.os.Process
 import com.bigrocket.egress.PathBond
 import com.bigrocket.egress.StaticProxyRuntime
 import com.bigrocket.egress.StaticProxyStore
+import com.bigrocket.egress.StaticProxyParser
 import com.bigrocket.egress.VirtualEgress
+import com.bigrocket.tunnel.AddressTunnelRuntime
+import com.bigrocket.tunnel.AddressTunnelStore
+import com.bigrocket.tunnel.TunnelSpecParser
 import com.bigrocket.ui.MainActivity
 import com.bigrocket.bonding.sandbox.VirtualBondingSandbox
 import com.bigrocket.network.DnsConfig
@@ -77,6 +81,11 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
         // leaving from the previous egress until the user reconnects.
         const val ACTION_PROXY_CHANGED = "com.bigrocket.service.PROXY_CHANGED"
 
+        // Sent after the user saves/clears the ADDRESS TUNNEL (engine 2). The Service re-reads the
+        // stored address, runs its self-test, and only then decides between engine 2 and the
+        // engine-1/direct fallback - so a typo can never black-hole connectivity.
+        const val ACTION_TUNNEL_CHANGED = "com.bigrocket.service.TUNNEL_CHANGED"
+
         // Watchdog: worst-case time we let a single controlMutex-guarded start/
         // stop/reset operation run before treating the process as unrecoverable.
         // NOT a fix for the freeze itself - a safety net. Several calls this
@@ -114,6 +123,10 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
         // purpose: this is a regression alarm for the bonding code itself, not a live signal
         // anything currently acts on.
         private const val SANDBOX_CHECK_INTERVAL_MS = 5 * 60_000L
+        // Address tunnel (engine 2) liveness tick: PING the far side, demote a silent channel,
+        // and re-test an address that had fallen back. Fast enough to notice a dead bridge
+        // before the user does, slow enough to cost nothing on the radios.
+        private const val ADDRESS_TUNNEL_TICK_MS = 5_000L
         // Refreshed every weight-update cycle (well under this), so it never actually expires
         // during normal operation - this is only a safety net against a stuck/leaked lock.
         private const val WAKE_LOCK_TIMEOUT_MS = 30_000L
@@ -170,6 +183,7 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
     @Volatile private var wifiLossRate = 0.0
     @Volatile private var cellularLossRate = 0.0
     private var sandboxCheckJob: Job? = null
+    private var addressTunnelJob: Job? = null
     // Last-known probe result per path, so the weight-update loop below can detect a
     // soft failure (ACTIVE/DEGRADED -> DISCONNECTED while Android still reports the network
     // as up) and evict pinned sessions immediately - see TunPacketRouter.notifySoftFailure.
@@ -299,6 +313,12 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
         // StaticProxyRuntime directly for every new flow, so a change saved in the UI applies
         // to the next connection without tearing the tunnel down.
         StaticProxyRuntime.install(StaticProxyStore.read(this))
+        // Address tunnel (engine 2): same policy - the saved address is re-installed on every
+        // Service creation, so a Service restarted by the system still knows about it. The
+        // runtime self-tests it (HELLO + PING) before claiming the egress and otherwise records
+        // the exact failure and leaves every flow on engine 1 / direct.
+        AddressTunnelRuntime.attachVpnService(this)
+        installAddressTunnel(testNow = true)
         // Rehydrate the exit-IP confirmation made before connecting (persisted by
         // EgressIpChecker) so a service restarted by the system keeps the bonded mode.
         if (!StaticProxyRuntime.isVerified()) {
@@ -585,6 +605,19 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
             return START_STICKY
         }
 
+        if (intent?.action == ACTION_TUNNEL_CHANGED) {
+            // Re-read and re-test off the main thread: the self-test does real I/O on both radios.
+            serviceScope.launch {
+                installAddressTunnel(testNow = true)
+                AppLogger.log(
+                    "VpnService",
+                    "address tunnel changed -> egress = ${VirtualEgress.describe()} " +
+                        "state=${AddressTunnelRuntime.stateName()}",
+                )
+            }
+            return START_STICKY
+        }
+
         if (intent?.action == ACTION_UPSTREAM_CHANGED) {
             if (isRunning) {
                 serviceScope.launch {
@@ -776,6 +809,7 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
             startWeightUpdates()
             startLossProbing()
             startPeriodicSandboxCheck()
+            startAddressTunnelHealthCheck()
 
             // Engine lifecycle ownership lives here now, not in MainActivity - see
             // ACTION_UPSTREAM_CHANGED and applyUpstreamChoice() below for why.
@@ -927,6 +961,9 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
         bondingUpstream?.updateNetworks(wifi, cellular)
         // The egress layer needs both paths to open one bonded UDP association per link.
         VirtualEgress.updateNetworks(wifi, cellular)
+        // The address tunnel opens ONE CARRIER PER RADIO and interleaves frames over both: that
+        // is the in-phone merge engine. It needs the same view of the radios.
+        AddressTunnelRuntime.updateNetworks(wifi, cellular)
         // Live aggregation counters need to know which Network is which path.
         PathLabels.updateNetworks(wifi, cellular)
         // Apply the "verified proxy is the endpoint" mode immediately (before the next weight
@@ -1304,6 +1341,50 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
     }
 
     /** Keeps the persistent notification's title/text in sync with AetherController.state. */
+    /**
+     * Reads the saved address, installs it, and lets [AddressTunnelRuntime] decide whether engine
+     * 2 may carry traffic. Blocking (bounded by the self-test's own timeouts) - callers are the
+     * Service's own threads, never the UI.
+     */
+    private fun installAddressTunnel(testNow: Boolean) {
+        val storedRaw = AddressTunnelStore.readRaw(this)
+        if (storedRaw.isNullOrBlank()) {
+            AddressTunnelRuntime.install(this, null)
+            return
+        }
+        val spec = runCatching {
+            TunnelSpecParser.parse(storedRaw) { text -> runCatching { StaticProxyParser.parse(text) }.isSuccess }
+        }.getOrNull()
+        if (spec == null) {
+            // The stored text is a PROXY, not an address: the static-proxy path owns it and the
+            // tunnel stays off (this is how old saved proxies keep working unchanged).
+            AddressTunnelRuntime.install(this, null)
+            AppLogger.log("VpnService", "stored address is a proxy form - engine 2 stays off")
+            return
+        }
+        AddressTunnelRuntime.install(this, spec, testNow = testNow)
+        AppLogger.log(
+            "VpnService",
+            "address tunnel: ${spec.endpointLabel()} state=${AddressTunnelRuntime.stateName()}",
+        )
+    }
+
+    /**
+     * Keeps engine 2 honest while it is the egress: a channel that has gone silent is demoted
+     * back to engine 1, and a fallen-back address is re-tested on a 30 s backoff (so a bridge
+     * that comes back up is picked up without the user touching the app).
+     */
+    private fun startAddressTunnelHealthCheck() {
+        addressTunnelJob?.cancel()
+        addressTunnelJob = serviceScope.launch {
+            while (isActive) {
+                delay(ADDRESS_TUNNEL_TICK_MS)
+                runCatching { AddressTunnelRuntime.retestIfDue() }
+                AddressTunnelRuntime.publishCounters()
+            }
+        }
+    }
+
     private fun startNotificationStateSync() {
         serviceScope.launch {
             combine(AetherController.state, UpstreamHealth.status) { state, _ -> state }

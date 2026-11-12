@@ -39,6 +39,11 @@ import com.bigrocket.egress.StaticProxyParseException
 import com.bigrocket.egress.StaticProxyParser
 import com.bigrocket.egress.StaticProxyRuntime
 import com.bigrocket.egress.StaticProxyStore
+import com.bigrocket.tunnel.AddressTunnelRuntime
+import com.bigrocket.tunnel.AddressTunnelStore
+import com.bigrocket.tunnel.TunnelSpec
+import com.bigrocket.tunnel.TunnelSpecParseException
+import com.bigrocket.tunnel.TunnelSpecParser
 import com.bigrocket.config.ConfigParseException
 import com.bigrocket.config.SubscriptionFetcher
 import com.bigrocket.network.DnsConfig
@@ -109,6 +114,11 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnClearStaticProxy: Button
     private lateinit var btnCheckEgressIp: Button
     private lateinit var tvStaticProxyStatus: TextView
+    // Address tunnel card (engine 2 in the phone): see tunnel/TunnelSpec.kt for accepted forms.
+    private lateinit var etTunnelAddress: android.widget.EditText
+    private lateinit var btnSaveTunnelAddress: Button
+    private lateinit var btnClearTunnelAddress: Button
+    private lateinit var tvTunnelStatus: TextView
     // DNS address: replaces hardcoded static DNS servers.
     private lateinit var etDnsAddress: android.widget.EditText
     private lateinit var btnSaveDnsAddress: Button
@@ -244,7 +254,12 @@ class MainActivity : AppCompatActivity() {
         tvEgressIp = findViewById(R.id.tvEgressIp)
         etDnsAddress = findViewById(R.id.etDnsAddress)
         btnSaveDnsAddress = findViewById(R.id.btnSaveDnsAddress)
+        etTunnelAddress = findViewById(R.id.etTunnelAddress)
+        btnSaveTunnelAddress = findViewById(R.id.btnSaveTunnelAddress)
+        btnClearTunnelAddress = findViewById(R.id.btnClearTunnelAddress)
+        tvTunnelStatus = findViewById(R.id.tvTunnelStatus)
         setupStaticProxyControls()
+        setupTunnelControls()
         setupDnsControls()
     }
 
@@ -359,6 +374,103 @@ class MainActivity : AppCompatActivity() {
             }
         }
     }
+
+    /**
+     * The ADDRESS TUNNEL card (engine 2 in the phone).
+     *
+     * Saving is deliberately "test then save": the user asked for "if the address exists, use
+     * engine 2 after testing; if not, go straight to sandbox + engine 1". So the button runs the
+     * real self-test (HELLO + PING over both radios) before anything is persisted or activated,
+     * and a failure is reported with the exact reason instead of silently changing the egress.
+     */
+    private fun setupTunnelControls() {
+        val stored = AddressTunnelStore.readRaw(this)
+        etTunnelAddress.setText(stored.orEmpty())
+
+        btnSaveTunnelAddress.setOnClickListener {
+            val raw = etTunnelAddress.text?.toString()?.trim().orEmpty()
+            if (raw.isEmpty()) {
+                Toast.makeText(this, "آدرس را وارد کنید", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            val spec = try {
+                TunnelSpecParser.parse(raw) { text -> runCatching { StaticProxyParser.parse(text) }.isSuccess }
+            } catch (e: TunnelSpecParseException) {
+                Toast.makeText(this, e.message, Toast.LENGTH_LONG).show()
+                return@setOnClickListener
+            }
+            if (spec == null) {
+                // Looks like a proxy, not an address: hand it to the static-proxy card instead of
+                // quietly doing something else with it.
+                etStaticProxy.setText(raw)
+                Toast.makeText(
+                    this,
+                    "این یک پروکسی است، نه آدرس تونل؛ در کادر استاتیک آی‌پی ذخیره شد",
+                    Toast.LENGTH_LONG,
+                ).show()
+                return@setOnClickListener
+            }
+            startTunnelTest(spec)
+        }
+
+        btnClearTunnelAddress.setOnClickListener {
+            etTunnelAddress.setText("")
+            runCatching { AddressTunnelStore.save(this, null) }
+            AddressTunnelRuntime.install(this, null)
+            notifyServiceOfTunnelChange()
+            Toast.makeText(this, "تونل آدرسی حذف شد", Toast.LENGTH_SHORT).show()
+        }
+
+        lifecycleScope.launch {
+            AddressTunnelRuntime.status.collectLatest { status ->
+                tvTunnelStatus.text = status.summary()
+            }
+        }
+    }
+
+    /** Runs the self-test off the UI thread, then persists + activates only if it passed. */
+    private fun startTunnelTest(spec: TunnelSpec) {
+        btnSaveTunnelAddress.isEnabled = false
+        btnSaveTunnelAddress.text = getString(R.string.address_tunnel_testing)
+        tvTunnelStatus.text = getString(R.string.address_tunnel_testing)
+        lifecycleScope.launch {
+            // Install wakes the runtime up; onNetworksUpdated has already given it the radios by
+            // now (the Service publishes them), and install() runs the same self-test the card
+            // promises.
+            val result = withContext(Dispatchers.IO) {
+                AddressTunnelRuntime.install(this@MainActivity, spec, testNow = true)
+                AddressTunnelRuntime.status.value
+            }
+            btnSaveTunnelAddress.isEnabled = true
+            btnSaveTunnelAddress.text = getString(R.string.address_tunnel_save)
+            if (result.ready) {
+                runCatching { AddressTunnelStore.save(this@MainActivity, spec) }
+                etTunnelAddress.setText(spec.canonical())
+                toast(
+                    "تونل تأیید شد: ${spec.endpointLabel()} (${result.pipes} مسیر، ${result.rttMs}ms) — موتور ۲ فعال است",
+                )
+            } else {
+                // Not saved on purpose: an address that did not answer must not come back after a
+                // restart and flip the egress to something dead.
+                runCatching { AddressTunnelStore.save(this@MainActivity, null) }
+                toast(
+                    "آدرس پاسخ نداد: ${result.lastError.ifEmpty { result.detail }} — همان موتور ۱ / خروجی مستقیم می‌ماند",
+                )
+            }
+            notifyServiceOfTunnelChange()
+        }
+    }
+
+    private fun notifyServiceOfTunnelChange() {
+        if (BigRocketVpnService.runningInstance != null) {
+            startService(
+                Intent(this, BigRocketVpnService::class.java)
+                    .setAction(BigRocketVpnService.ACTION_TUNNEL_CHANGED)
+            )
+        }
+    }
+
+    private fun toast(message: String) = Toast.makeText(this, message, Toast.LENGTH_LONG).show()
 
     /**
      * Runs ProxyPortDetector for a portless proxy on a background thread and reports the

@@ -3,9 +3,10 @@ package com.bigrocket.network
 import java.io.IOException
 import java.net.InetAddress
 import okhttp3.MediaType
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.RequestBody
+import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.ResponseBody
 
 /**
@@ -29,7 +30,7 @@ object DohClient {
         .writeTimeout(REQUEST_TIMEOUT_MS, java.util.concurrent.TimeUnit.MILLISECONDS)
         .build()
 
-    private val DNS_MEDIA_TYPE = MediaType.get("application/dns-message")
+    private val DNS_MEDIA_TYPE = "application/dns-message".toMediaType()
 
     /**
      * Resolves the first IPv4 address reachable through [dohUrl].
@@ -43,7 +44,7 @@ object DohClient {
         val query = buildDnsQuery(DNS_QUERY_DOMAIN)
         val request = Request.Builder()
             .url(dohUrl)
-            .post(RequestBody.create(query, DNS_MEDIA_TYPE))
+            .post(query.toRequestBody(DNS_MEDIA_TYPE))
             .header("Accept", "application/dns-message")
             .header("Content-Type", "application/dns-message")
             .build()
@@ -108,8 +109,12 @@ object DohClient {
             val rdlength = (response[offset].toInt() and 0xFF) shl 8 or (response[offset + 1].toInt() and 0xFF)
             offset += 2 // RDLENGTH
             if (type == 1 && rdlength == 4 && offset + 4 <= response.size) {
-                // A record: 4 bytes = IPv4
-                return "${response[offset] and 0xFF}.${response[offset + 1] and 0xFF}.${response[offset + 2] and 0xFF}.${response[offset + 3] and 0xFF}"
+                // A record: 4 bytes = IPv4. (`and` must be parenthesised inside a template:
+                // otherwise the expression parser reads `${a and 0xFF}` as a reference to `and`.)
+                return "${response[offset].toInt() and 0xFF}." +
+                    "${response[offset + 1].toInt() and 0xFF}." +
+                    "${response[offset + 2].toInt() and 0xFF}." +
+                    "${response[offset + 3].toInt() and 0xFF}"
             }
             offset += rdlength
         }

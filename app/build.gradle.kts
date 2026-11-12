@@ -3,6 +3,18 @@ plugins {
     alias(libs.plugins.kotlin.compose)
 }
 
+/**
+ * ABIs to package. Overridable so a single-ABI (armeabi-v7a) test build does not need the
+ * arm64 natives staged; every consumer (ndk.abiFilters AND verifyAetherEngineAssets below)
+ * reads this one list, because a mismatch between them is exactly how the "missing engine
+ * asset" build failure happens.
+ */
+fun brAbis(): List<String> {
+    val raw = (project.findProperty("brAbis") as String?)
+        ?: "arm64-v8a,armeabi-v7a"
+    return raw.split(',').map { it.trim() }.filter { it.isNotEmpty() }
+}
+
 android {
     namespace = "com.bigrocket"
     compileSdk = 37
@@ -13,15 +25,17 @@ android {
         targetSdk = 37
         // Bumped so a new build always upgrades an older install cleanly (an identical
         // versionCode makes some installers refuse with "App not installed").
-        versionCode = 6
-        versionName = "1.5"
+        versionCode = 7
+        versionName = "1.6-address-tunnel"
         buildConfigField("String", "CORE_VERSION", "\"embedded-aether\"")
         multiDexEnabled = true
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
         ndk {
-            abiFilters.addAll(listOf("arm64-v8a", "armeabi-v7a"))
+            // Both ABIs by default; `-PbrAbis=armeabi-v7a` narrows it (used for the test APK,
+            // and by anyone who does not want the extra ~35 MB of arm64 natives).
+            abiFilters.addAll(brAbis())
         }
     }
 
@@ -57,11 +71,18 @@ android {
             useLegacyPackaging = true
         }
     }
+
+    // far-side/ is the bridge the user runs on their server. Compiling it INTO the unit-test
+    // source set (tools/sync-bridge.sh copies it to app/src/test/java/bridgesrc/) means the
+    // tests exercise the shipped file, not a mock of it.
+    sourceSets.getByName("test") {
+        java.srcDir("src/test/java")
+    }
 }
 
 tasks.register("verifyAetherEngineAssets") {
     doLast {
-        val requiredAbis = listOf("arm64-v8a", "armeabi-v7a")
+        val requiredAbis = brAbis()
         requiredAbis.forEach { abi ->
             val engine = file("src/main/assets/aether/$abi/libaether.so")
             if (!engine.isFile || engine.length() == 0L) {

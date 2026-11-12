@@ -263,4 +263,14 @@
     <string name="upstream_help">Dials out through a proxy already running on this phone. socks5://host:port carries every protocol; http://host:port only carries MASQUE over HTTP/2, which is switched on for you. Credentials may be included as user:pass@host:port and are passed to the engine privately, never on its command line. Leave empty to connect directly.</string>
     <string name="reprovision_title">Replace a refused identity</string>
     <string name="reprovision_desc">If Cloudflare stops accepting the saved device identity, register a fresh one automatically instead of holding a tunnel that connects but carries no traffic.</string>
+    <!-- Address tunnel (engine 2, the merge running inside the phone) -->
+    <string name="address_tunnel_title">Address tunnel (engine 2, in the phone)</string>
+    <string name="address_tunnel_help">Enter just an address: a plain IP (e.g. 203.0.113.9), a DNS name, or a DoH endpoint (https://host/dns-query). Nothing has to run on port 1080/8080 - the address only says where the merged channel goes. The app tests it first; if it does not answer, it falls back to the static proxy / direct egress below.</string>
+    <string name="address_tunnel_hint">203.0.113.9 or bridge.example.org or https://host/dns-query</string>
+    <string name="address_tunnel_save">Test and save</string>
+    <string name="address_tunnel_clear">Clear</string>
+    <string name="address_tunnel_off">Address tunnel: off - engine 1 / direct egress</string>
+    <string name="address_tunnel_testing">Testing the address (HELLO + PING)…</string>
+    <string name="address_tunnel_ok">Address tunnel: active and verified</string>
+    <string name="address_tunnel_failed">Address tunnel: failed - falling back to engine 1 / direct</string>
 </resources>
