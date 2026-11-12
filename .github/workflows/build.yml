@@ -173,9 +173,18 @@ jobs:
           for abi in $(echo "$ABIS" | tr ',' ' '); do
             # AGP names split APKs after the ABI; fall back to the single universal
             # artifact if this build did not split.
-            apk="app/build/outputs/apk/release/app-$abi-release.apk"
-            [ -s "$apk" ] || apk="app/build/outputs/apk/release/app-release-$abi.apk"
-            [ -s "$apk" ] || { echo "::error::no APK produced for $abi"; ls -l app/build/outputs/apk/release/; exit 1; }
+            # AGP names a split APK app-<abi>-release[-unsigned].apk depending on whether
+            # signing is configured in the build; take whichever exists instead of
+            # guessing, so this step cannot fail on a naming change.
+            apk=""
+            for candidate in \
+                "app/build/outputs/apk/release/app-$abi-release-unsigned.apk" \
+                "app/build/outputs/apk/release/app-$abi-release.apk" \
+                "app/build/outputs/apk/release/app-release-$abi.apk"; do
+                if [ -s "$candidate" ]; then apk="$candidate"; break; fi
+            done
+            [ -n "$apk" ] || { echo "::error::no APK produced for $abi"; ls -l app/build/outputs/apk/release/; exit 1; }
+            echo "signing $apk -> $OUT/BigRocket-$abi.apk"
             aligned="$OUT/BigRocket-$(date +%Y%m%d)-$abi-aligned.apk"
             final="$OUT/BigRocket-$abi.apk"
             "$BT/zipalign" -f -p 4 "$apk" "$aligned"
