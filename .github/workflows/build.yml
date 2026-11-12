@@ -75,7 +75,11 @@ jobs:
       # ---------------------------------------------------------------------------
       - name: Stage prebuilt natives (both ABIs)
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Optional. Everything staged here comes from the *public* upstream release, so
+          # no token is required; a PAT in NATIVES_TOKEN only avoids GitHub's anonymous
+          # API rate limit. The workflow's own GITHUB_TOKEN is scoped to this repository
+          # and cannot read another repository's release, which is why it is not used.
+          GITHUB_TOKEN: ${{ secrets.NATIVES_TOKEN }}
         run: |
           chmod +x scripts/*.sh
           scripts/stage-prebuilt-natives.sh
