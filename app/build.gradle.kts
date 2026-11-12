@@ -33,9 +33,27 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
         ndk {
-            // Both ABIs by default; `-PbrAbis=armeabi-v7a` narrows it (used for the test APK,
-            // and by anyone who does not want the extra ~35 MB of arm64 natives).
-            abiFilters.addAll(brAbis())
+            // NOTE: no abiFilters here. `ndk.abiFilters` and `splits.abi.include` are
+            // mutually exclusive in AGP ("Conflicting configuration ... cannot be present
+            // when splits abi filters are set"), so the ABI list lives in the `splits`
+            // block below and both of them read brAbis() - the single source of truth
+            // shared with verifyAetherEngineAssets.
+        }
+    }
+
+    /**
+     * One APK per ABI instead of a single universal one. The natives are ~173 MB of the
+     * output, so a universal APK forces every 32-bit phone to download the 64-bit set as
+     * well. Split APKs are also what the release workflow publishes (one file per
+     * architecture). `brAbis()` stays the single source of truth, so a narrow build
+     * (`-PbrAbis=armeabi-v7a`) still produces exactly one split.
+     */
+    splits {
+        abi {
+            isEnable = true
+            reset()
+            include(*brAbis().toTypedArray())
+            isUniversalApk = false
         }
     }
 

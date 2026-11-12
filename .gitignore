@@ -19,3 +19,7 @@ app/src/main/assets/server_entries.txt
 far-side/.kotlin/
 far-side/bridge.jar
 dist/
+
+# Local signing material (never commit a keystore)
+*.jks
+*.keystore

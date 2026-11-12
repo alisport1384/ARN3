@@ -7,6 +7,14 @@ on:
     branches: [ "main", "master" ]
   workflow_dispatch:
 
+permissions:
+  contents: write   # needed to publish the release at the end
+
+env:
+  # One place for the whole workflow. The Gradle build reads the ABI list from
+  # -PbrAbis, and the split-APK step reads it from here, so they cannot drift apart.
+  ABIS: "arm64-v8a,armeabi-v7a"
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -15,25 +23,26 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Set up JDK 17
+      # JDK 21: AGP 9.2 requires it. With JDK 17 the Gradle step dies before compiling
+      # anything ("Android Gradle plugin requires Java 21").
+      - name: Set up JDK 21
         uses: actions/setup-java@v4
         with:
-          java-version: '17'
+          java-version: '21'
           distribution: 'temurin'
           cache: 'gradle'
 
       # The hosted runner's preinstalled Android SDK does not reliably include
-      # very recent platforms/build-tools (compileSdk 35 here), and their
+      # very recent platforms/build-tools (compileSdk 37 here), and their
       # licenses are not pre-accepted. Without this step, "./gradlew assembleDebug"
-      # fails with "You have not accepted the license agreements..." and no APK
-      # is ever produced.
+      # fails with "You have not accepted the license agreements...".
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
         with:
           # Google removed the deprecated 'tools' package from the SDK repo
           # index (2026-09-15); the action's default `packages` input still
           # requests it, so the step fails before anything else runs. We only
-          # ever used this step for cmdline-tools/platform-tools anyway —
+          # ever used this step for cmdline-tools/platform-tools anyway -
           # platforms/build-tools/ndk are installed explicitly below.
           packages: "platform-tools"
 
@@ -41,11 +50,6 @@ jobs:
         run: |
           sdkmanager --install "platforms;android-37.0" "build-tools;37.0.0" "ndk;26.3.11579264"
           yes | sdkmanager --licenses || true
-
-      - name: Set up Android NDK
-        uses: android-actions/setup-android@v3
-        with:
-          packages: "platform-tools"
 
       - name: Install Rust toolchain and Android targets
         shell: bash
@@ -57,6 +61,24 @@ jobs:
 
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --locked
+
+      # ---------------------------------------------------------------------------
+      # Natives. Two scripts, in this order:
+      #   stage-prebuilt-natives.sh - the libraries we do not compile ourselves
+      #                               (libpsiphon.so, libxray.so, the runtime .so files).
+      #                               THIS WAS MISSING and is why every run before
+      #                               2026-11-12 failed at :app:verifyAetherEngineAssets
+      #                               with "Missing Psiphon client for arm64-v8a".
+      #   build-natives.sh / build-xray.sh - the ones we do compile; they run after and
+      #                               keep what they produce (the stager never overwrites
+      #                               an existing .so).
+      # ---------------------------------------------------------------------------
+      - name: Stage prebuilt natives (both ABIs)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          chmod +x scripts/*.sh
+          scripts/stage-prebuilt-natives.sh
 
       - name: Prepare Aether native sources
         run: |
@@ -80,17 +102,135 @@ jobs:
           ANDROID_NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/26.3.11579264
         run: scripts/build-xray.sh
 
+      - name: Verify natives for every shipped ABI
+        run: |
+          ok=1
+          for abi in $(echo "$ABIS" | tr ',' ' '); do
+            for lib in libaether.so libxray.so libpsiphon.so libhev-socks5-tunnel.so; do
+              if [ ! -s "app/src/main/jniLibs/$abi/$lib" ]; then
+                echo "::error::missing app/src/main/jniLibs/$abi/$lib"
+                ok=0
+              fi
+            done
+            if [ ! -s "app/src/main/assets/aether/$abi/libaether.so" ]; then
+              echo "::error::missing app/src/main/assets/aether/$abi/libaether.so"
+              ok=0
+            fi
+          done
+          if [ ! -s app/src/main/assets/server_entries.txt ]; then
+            echo "::error::missing app/src/main/assets/server_entries.txt"
+            ok=0
+          fi
+          exit $((1 - ok))
+
       - name: Grant Execute Permission to Gradle Wrapper
         run: chmod +x ./gradlew
 
-      - name: Build with Gradle
-        run: ./gradlew assembleRelease --stacktrace --no-daemon
+      - name: Unit tests
+        run: ./gradlew testDebugUnitTest -PbrAbis="$ABIS" --no-daemon --stacktrace
 
-      - name: Upload Release APKs (arm64-v8a + armeabi-v7a)
+      - name: Build release APKs (one per ABI)
+        run: ./gradlew assembleRelease -PbrAbis="$ABIS" --no-daemon --stacktrace
+
+      - name: Sign release APKs
+        id: sign
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          BT="$(ls -d "$ANDROID_SDK_ROOT"/build-tools/37.0.0)"
+          OUT=dist
+          mkdir -p "$OUT"
+
+          if [ -n "${KEYSTORE_BASE64:-}" ]; then
+            echo "signing: using the repository's release key"
+            echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+            KS="$RUNNER_TEMP/release.jks"
+            STORE_PASS="${KEYSTORE_PASSWORD:?KEYSTORE_PASSWORD is not set}"
+            KEY_PASS="${KEY_PASSWORD:-$STORE_PASS}"
+          else
+            # No secret configured: still produce *installable* APKs with a throwaway
+            # key, and say so in the release notes. An unsigned release APK cannot be
+            # installed at all, which is worse than an honest test key.
+            echo "signing: KEYSTORE_BASE64 is not set - generating a throwaway key"
+            KS="$RUNNER_TEMP/test.jks"
+            STORE_PASS="bigrocket"
+            KEY_PASS="bigrocket"
+            KEY_ALIAS="bigrocket"
+            keytool -genkeypair -keystore "$KS" -storepass "$STORE_PASS" \
+              -keypass "$KEY_PASS" -alias "$KEY_ALIAS" -keyalg RSA -keysize 2048 \
+              -validity 10000 -dname "CN=BigRocket Test, OU=Test, O=BigRocket, L=Test, ST=Test, C=IR" >/dev/null
+            echo "TEST_KEY=1" >> "$GITHUB_ENV"
+          fi
+
+          for abi in $(echo "$ABIS" | tr ',' ' '); do
+            # AGP names split APKs after the ABI; fall back to the single universal
+            # artifact if this build did not split.
+            apk="app/build/outputs/apk/release/app-$abi-release.apk"
+            [ -s "$apk" ] || apk="app/build/outputs/apk/release/app-release-$abi.apk"
+            [ -s "$apk" ] || { echo "::error::no APK produced for $abi"; ls -l app/build/outputs/apk/release/; exit 1; }
+            aligned="$OUT/BigRocket-$(date +%Y%m%d)-$abi-aligned.apk"
+            final="$OUT/BigRocket-$abi.apk"
+            "$BT/zipalign" -f -p 4 "$apk" "$aligned"
+            "$BT/apksigner" sign --ks "$KS" --ks-pass "pass:$STORE_PASS" \
+              --key-pass "pass:$KEY_PASS" --ks-key-alias "${KEY_ALIAS:-bigrocket}" \
+              --out "$final" "$aligned"
+            "$BT/apksigner" verify "$final"
+            rm -f "$aligned"
+            echo "signed $final ($(stat -c%s "$final") bytes)"
+          done
+          ls -l "$OUT"
+
+      - name: Collect checksums
+        run: |
+          cd dist
+          sha256sum *.apk | tee SHA256SUMS.txt
+
+      - name: Upload release APKs
         uses: actions/upload-artifact@v4
         with:
           name: BigRocket-release-apks
           path: |
-            app/build/outputs/apk/release/app-release-arm64-v8a.apk
-            app/build/outputs/apk/release/app-release-armeabi-v7a.apk
+            dist/BigRocket-arm64-v8a.apk
+            dist/BigRocket-armeabi-v7a.apk
+            dist/SHA256SUMS.txt
           if-no-files-found: error
+
+      # A downloadable APK that only lives in a workflow artifact needs a GitHub login
+      # to fetch, so publish a proper release as well: the two APKs plus the checksums.
+      - name: Publish release
+        if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="$(grep -oP 'versionName\s*=\s*"\K[^"]+' app/build.gradle.kts | head -1)"
+          CODE="$(grep -oP 'versionCode\s*=\s*\K[0-9]+' app/build.gradle.kts | head -1)"
+          TAG="v${VERSION}-b${CODE}"
+          NOTES="BigRocket ${VERSION} (versionCode ${CODE}) - address tunnel.
+
+          Two architectures in one release:
+            BigRocket-arm64-v8a.apk    - 64-bit ARM (most phones from 2017 on)
+            BigRocket-armeabi-v7a.apk  - 32-bit ARM (older / low-end phones)
+
+          Install the one that matches the phone. If unsure, the armeabi-v7a build also
+          runs on 64-bit devices."
+          if [ "${TEST_KEY:-0}" = "1" ]; then
+            NOTES="$NOTES
+
+          NOTE: these APKs are signed with a THROWAWAY test key (no KEYSTORE_BASE64
+          secret is configured). Uninstall any previous BigRocket before installing
+          this one - Android refuses an update signed with a different key."
+          fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/*.apk dist/SHA256SUMS.txt --clobber
+            gh release edit "$TAG" --notes "$NOTES"
+          else
+            gh release create "$TAG" dist/*.apk dist/SHA256SUMS.txt \
+              --title "BigRocket ${VERSION} (${CODE})" \
+              --notes "$NOTES"
+          fi
+          echo "release: https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
