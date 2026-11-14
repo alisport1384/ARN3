@@ -173,7 +173,9 @@ class MuxSession(
         }
 
         internal fun onData(offset: Long, data: ByteArray) {
-            if (reorderer.offer(offset, data)) firstMissingSince = 0L
+            // A chunk that lands ahead of the hole does not close it, so only a real resolution
+            // resets the budget. See resetHole().
+            if (reorderer.offer(offset, data)) resetHole()
         }
 
         /** Called by the session after every DATA batch so a waiting FIN can complete. */
@@ -208,7 +210,7 @@ class MuxSession(
                     }
                 }
                 val missing = reorderer.firstMissing() ?: run {
-                    firstMissingSince = 0L
+                    resetHole()
                     return
                 }
                 // GRACE PERIOD. On two radios a "hole" is usually just a frame still in flight
@@ -217,14 +219,27 @@ class MuxSession(
                 // retransmission storm); waiting one RTT-ish interval costs nothing when the
                 // frame really was lost and removes almost all of that traffic.
                 val now = System.currentTimeMillis()
-                if (firstMissingSince == 0L) firstMissingSince = now
+                // A new hole starts a new budget. Without this line nackTries was counted for the
+                // whole life of the stream: a phone keeps one tunnel open for hours, and after
+                // MAX_NACKS holes (six frames lost anywhere in that time) the receiver silently
+                // stopped asking for repairs, so every later hole stalled until the reader timed
+                // out. maxOf, not assignment: firstMissingSince is written from the carrier
+                // threads too, and a legitimate value must not be zeroed by a racing drain().
+                if (firstMissingSince == 0L || missing != nackedOffset) {
+                    firstMissingSince = now
+                    nackTries = 0
+                }
+                nackedOffset = missing
                 if (now - firstMissingSince < NACK_GRACE_MS) return
                 if (now - lastNackAt >= NACK_INTERVAL_MS && nackTries < MAX_NACKS) {
                     lastNackAt = now
                     nackTries++
                     val length = minOf(Brt.MAX_PAYLOAD.toLong(), missing - reorderer.nextExpected()).toInt()
                     val body = Brt.intBytes(reorderer.nextExpected().toInt()) + Brt.intBytes(maxOf(1, length))
-                    send(Brt.NACK, Brt.withStreamId(streamId, body))
+                    // Counted at the source, not inferred: totalNacksSent existed but nothing
+                    // ever incremented it, so the UI and the logs reported 0 repairs during a
+                    // repair. totalNacksIn is incremented by the session's NACK handler.
+                    if (send(Brt.NACK, Brt.withStreamId(streamId, body))) totalNacksSent.incrementAndGet()
                 }
             }
         }
@@ -235,8 +250,18 @@ class MuxSession(
         /** When the current hole was first noticed; 0 = no hole. */
         private var firstMissingSince = 0L
 
+        /** Offset of the hole the current [nackTries] budget belongs to. */
+        private var nackedOffset = -1L
+
         private var lastNackAt = 0L
         private var nackTries = 0
+
+        /** The hole is gone: forget it, and hand the next hole a fresh budget. */
+        private fun resetHole() {
+            firstMissingSince = 0L
+            nackedOffset = -1L
+            nackTries = 0
+        }
 
         internal fun onOpenOk(remote: String?) {
             remoteAddressLabel = remote ?: "?"
@@ -388,6 +413,7 @@ class MuxSession(
     private val channelReady = AtomicBoolean(false)
     private val nonce = ByteArray(8).also { java.security.SecureRandom().nextBytes(it) }
     @Volatile private var datagramChannel: MuxDatagramChannel? = null
+    @Volatile private var watchdog: Thread? = null
     @Volatile private var lastInboundAt = 0L
     @Volatile private var lastPingAt = 0L
     @Volatile private var downReason: String = ""
@@ -430,6 +456,7 @@ class MuxSession(
             while (System.currentTimeMillis() < waitUntil) {
                 if (channelReady.get()) {
                     AppLog.info(TAG, "session up: $describe")
+                    startWatchdog()
                     return true
                 }
                 sleepQuietly(20)
@@ -458,6 +485,40 @@ class MuxSession(
     /** True if the far side answered recently enough to be trusted. */
     fun isLive(maxSilenceMs: Long = 30_000): Boolean =
         running.get() && lastInboundAt > 0 && System.currentTimeMillis() - lastInboundAt < maxSilenceMs
+
+    /**
+     * Repairs holes WITHOUT waiting for another frame to arrive.
+     *
+     * `drain()` is what notices a hole and sends the NACK, and it used to run only when a DATA
+     * frame landed. That is the wrong trigger for the case it exists for: if a frame is lost and
+     * the far side then fills the flow-control window, it stops sending - so no DATA arrives, so
+     * nothing ever asks for the missing chunk, and the stream deadlocks until the reader times
+     * out. Measured: 8 holes in a 6 MiB transfer stalled the socket at 40 s, and the two-radio
+     * TLS test failed intermittently on a fast machine for the same reason.
+     *
+     * Re-running the check on a timer costs one map lookup per stream every [WATCHDOG_INTERVAL_MS]
+     * and turns "the link must deliver something before we can recover" into "we recover in one
+     * interval": at most two NACK round trips, well inside the 60 s read timeout.
+     */
+    private fun startWatchdog() {
+        if (watchdog?.isAlive == true) return
+        watchdog = Thread({
+            while (running.get()) {
+                try {
+                    Thread.sleep(WATCHDOG_INTERVAL_MS)
+                } catch (_: InterruptedException) {
+                    return@Thread
+                }
+                if (!running.get()) return@Thread
+                for (stream in streams.values) {
+                    runCatching { stream.drain() }
+                }
+            }
+        }, "brt-mux-watchdog-$label").apply {
+            isDaemon = true
+            start()
+        }
+    }
 
     /**
      * Opens [host]:[port] through the tunnel - the per-flow cost this whole design removes.
@@ -556,6 +617,8 @@ class MuxSession(
     fun close() {
         running.set(false)
         channelReady.set(false)
+        watchdog?.interrupt()
+        watchdog = null
         streams.values.forEach { runCatching { it.close() } }
         streams.clear()
         carrier.close()
@@ -710,9 +773,25 @@ class MuxSession(
         const val PING_INTERVAL_MS = 5_000L
         const val NACK_INTERVAL_MS = 40L
         const val MAX_NACKS = 6
-        const val RESEND_CACHE = 128
+        /**
+         * How many chunks the far side keeps for replay. DERIVED from the window, not chosen:
+         * the far side may be a full [INITIAL_WINDOW] ahead of the receiver's oldest hole, so a
+         * shallower cache cannot fill an early hole and the stream stalls. It was 128 while the
+         * window needed 189, which is exactly how `aStreamSplitAcrossTwoRadiosSurvivesADeadRadio`
+         * came to time out on a fast runner: the burst outran the replay buffer. The extra 32
+         * chunks absorb reordering and the NACK round trip on top of the window.
+         * Guarded by MuxRetransmitReachTest.
+         */
+        const val RESEND_CACHE = INITIAL_WINDOW / MAX_CHUNK + 32
         /** How long a hole may exist before a NACK is worth sending (transient reordering is normal). */
         const val NACK_GRACE_MS = 60L
+
+        /**
+         * How often the session re-checks open streams for a hole the arrival of frames never
+         * reported. Must be well under the grace period's relevance window and far under
+         * [READ_TIMEOUT_MS]; 100 ms costs nothing and keeps the repair invisible.
+         */
+        const val WATCHDOG_INTERVAL_MS = 100L
         const val MAX_QUEUED_DATAGRAMS = 64
     }
 }

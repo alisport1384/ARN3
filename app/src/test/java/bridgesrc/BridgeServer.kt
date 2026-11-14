@@ -368,11 +368,20 @@ class Stream(
 
     private val recentOut = LinkedHashMap<Long, ByteArray>()
 
+    /**
+     * Chunks kept for replay, DERIVED from the phone's receive window (see [recentOut]).
+     * `BrtWire.WINDOW` is the frame TYPE, not a size - use the window constant.
+     */
+    private val RESEND_CACHE = Stream.INITIAL_WINDOW / (BrtWire.MAX_PAYLOAD - 6) + 32
+
     val bytesToRemote = AtomicLong(0)
     val bytesToPhone = AtomicLong(0)
 
     private var lastNackAt = 0L
     private var nackTries = 0
+
+    /** NACKs that could not be honoured because the replay cache had already evicted the chunk. */
+    val resendMisses = AtomicLong(0)
 
     private companion object {
         /** How far the phone may run ahead of what we have written to the real socket. */
@@ -523,7 +532,12 @@ class Stream(
                     val body = BrtWire.intBytes(offsetInt) + payload
                     synchronized(lock) {
                         recentOut[offset] = payload
-                        while (recentOut.size > 128) {
+                        // Keep at least a full phone receive window's worth of chunks. The phone
+                        // may be WINDOW bytes behind the oldest hole, so a shallower cache cannot
+                        // repair an early hole: the NACK arrives, the chunk is gone, and the
+                        // stream stalls until the phone times out. Measured with a limit of 128:
+                        // "resend miss: no cached chunk at 161459 (have 128)" and a dead flow.
+                        while (recentOut.size > RESEND_CACHE) {
                             val it = recentOut.keys.iterator()
                             it.next()
                             it.remove()
@@ -550,7 +564,13 @@ class Stream(
         var cursor = offset
         val end = offset + length
         while (cursor < end) {
-            val chunk = synchronized(lock) { recentOut[cursor] } ?: return
+            val chunk = synchronized(lock) { recentOut[cursor] } ?: run {
+                // A miss means the cache is too shallow for the phone's window - the NACK
+                // arrives and cannot be honoured, so the flow dies. Counted per stream and
+                // summed by stats(), so it can be asserted instead of eyeballed.
+                resendMisses.incrementAndGet()
+                return
+            }
             router.send(BrtWire.DATA, BrtWire.withStreamId(id, BrtWire.intBytes(cursor.toInt()) + chunk))
             cursor += chunk.size
         }
@@ -665,6 +685,7 @@ class BridgeServer(
         }
         log("replayed ${queue.size} early frame(s) for stream #$id")
     }
+    private val totalNacksIn = AtomicLong(0)
     private val datagrams = DatagramRelay(router, log)
     private val running = AtomicBoolean(true)
     private val accepted = AtomicLong(0)
@@ -1035,6 +1056,7 @@ class BridgeServer(
 
             BrtWire.NACK -> {
                 if (payload.size < 10) return
+                totalNacksIn.incrementAndGet()
                 val stream = streams[BrtWire.streamId(payload)] ?: return
                 stream.resend(BrtWire.readInt(payload, 2).toLong() and 0xFFFFFFFFL, BrtWire.readInt(payload, 6))
             }
@@ -1049,7 +1071,8 @@ class BridgeServer(
     }
 
     fun stats(): String =
-        "pipes=${router.pipeCount()} streams=${streams.size} opens=$accepted cookie=$cookie"
+        "pipes=${router.pipeCount()} streams=${streams.size} opens=$accepted cookie=$cookie " +
+            "nacks=$totalNacksIn resendMisses=${streams.values.sumOf { it.resendMisses.get() }}"
 }
 
 // ---------------------------------------------------------------------------------------------
