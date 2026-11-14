@@ -223,7 +223,14 @@ jobs:
           VERSION="$(grep -oP 'versionName\s*=\s*"\K[^"]+' app/build.gradle.kts | head -1)"
           CODE="$(grep -oP 'versionCode\s*=\s*\K[0-9]+' app/build.gradle.kts | head -1)"
           TAG="v${VERSION}-b${CODE}"
-          NOTES="BigRocket ${VERSION} (versionCode ${CODE}) - address tunnel.
+          # A heredoc, not NOTES="...". The notes contain a quoted phrase ("the flow dies..."),
+          # and an inner double quote CLOSES a double-quoted shell string: the rest of the text
+          # was then executed as commands and the step died with
+          #     line 20: flow: command not found   (exit 127)
+          # Everything between the delimiter below is literal, quotes and all; the delimiter is
+          # UNQUOTED on purpose so ${VERSION} and ${CODE} still expand.
+          NOTES="$(cat <<NOTES_EOF
+          BigRocket ${VERSION} (versionCode ${CODE}) - address tunnel.
 
           PSIPHON IS NOW AVAILABLE IN THE Direct + Xray MODE, not only Direct + Aether.
           Xray's core has no --psiphon switch, so the hop is a standalone libpsiphon.so
@@ -238,7 +245,7 @@ jobs:
           by exactly one mechanism - XrayPsiphonHop for Direct + Xray, the engine's own
           PsiphonHop for every chain containing Aether - so no chain can get two hops.
 
-          THREE TUNNEL BUGS FIXED (all of them "the flow dies and never recovers"):
+          THREE TUNNEL BUGS FIXED, all of them 'the flow dies and never recovers':
             1. The replay cache was shallower than the receive window (128 chunks kept vs
                189 needed), so a hole early in a fast burst could never be filled. Both
                ends now derive the depth from the window.
@@ -249,8 +256,8 @@ jobs:
                anywhere in a tunnel's life repairs stopped entirely. It resets per hole.
 
           ONE TLS STREAM OVER TWO RADIOS (measured, SeparatorTlsOverAddressTunnelTest):
-            1 radio  =  8.05 Mbps (2083 ms)
-            2 radios = 16.10 Mbps (1042 ms)   ->  2.00x, radios used 2/2
+            1 radio  =  8.05 Mbps (2084 ms)
+            2 radios = 16.61 Mbps (1010 ms)   ->  2.06x, radios used 2/2
           A real TLS 1.3 connection is fragmented by the address tunnel, carried over Wi-Fi
           and cellular at once, reassembled and verified byte-for-byte - no CA, no
           interception. Each radio is capped at 1 MB/s in the test so the radios, not
@@ -266,9 +273,11 @@ jobs:
 
           Full notes: docs/PsiphonOverXray-fa.md, docs/TwoRadiosOneTlsStream.md and
           docs/RELEASE-1.6-address-tunnel.md in the source tree.
-          Test suite: 25 suites / 226 tests. A live connection to the Psiphon network is
+          Test suite: 26 suites / 226 tests. A live connection to the Psiphon network is
           not covered by the tests - it needs a handset. Look for the log line
-          'psiphon stage live on 127.0.0.1:1821 -> 1839' on first run."
+          'psiphon stage live on 127.0.0.1:1821 -> 1839' on first run.
+          NOTES_EOF
+          )"
           if [ "${TEST_KEY:-0}" = "1" ]; then
             NOTES="$NOTES
 
