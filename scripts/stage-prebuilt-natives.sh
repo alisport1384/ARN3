@@ -45,7 +45,13 @@ UPSTREAM_APK="Aether-1.6.0-%s.apk"
 # expects `hev.htproxy.TProxyService` - loading it inside BigRocket crashes the process
 # on the first tunnel start. So the hev/xray/aethertun binaries are taken from here, never
 # from the upstream APK.
-BIGROCKET_BASE="${BIGROCKET_BASE:-https://github.com/alisport1384/ARN2/releases/download/v1.6-address-tunnel-b7}"
+# THIS repository's own release, not a sibling project's. The stager used to hard-code
+# alisport1384/ARN2, which made the tree un-buildable the moment that release was removed
+# (404 "cannot download the BigRocket arm64-v8a APK", CI red before anything compiled).
+# Pointing at our own release means the repo can always reproduce its own build: every
+# release this workflow publishes contains these same four libraries, so the newest tag
+# always has what an older checkout needs. Override with BIGROCKET_BASE for a one-off.
+BIGROCKET_BASE="${BIGROCKET_BASE:-https://github.com/alisport1384/ARN3/releases/download/v1.6-address-tunnel-b8}"
 BIGROCKET_APK="BigRocket-%s.apk"
 
 # Libraries taken from the upstream (Aether) APK: pure runtime pieces, identical for
