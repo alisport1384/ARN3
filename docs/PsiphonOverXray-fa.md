@@ -105,3 +105,27 @@ Psiphon فقط SOCKS5 `CONNECT` دارد — `UDP ASSOCIATE` ندارد. پس UD
 نیاز به گوشی با شبکهٔ واقعی دارد و در محیط ساخت قابل اجرا نیست. اولین اجرای روی دستگاه
 باید با لاگ `XrayPsiphon` بررسی شود: خط `psiphon stage live on 127.0.0.1:1821 -> 1839`
 یعنی مرحله بالا آمده.
+
+## یک باگ دیگر که سر راه پیدا شد
+
+`scripts/stage-prebuilt-natives.sh` چهار کتابخانهٔ موتور (`libhev-socks5-tunnel`,
+`libxray`, `libaethertun`, `libaether`) را از ریلیز **ARN2** برمی‌داشت:
+
+```
+https://github.com/alisport1384/ARN2/releases/download/v1.6-address-tunnel-b7
+```
+
+آن ریلیز حذف شد و مرحله با این خط مرد:
+
+```
+curl: (22) The requested URL returned error: 404
+stage-prebuilt-natives: cannot download the BigRocket arm64-v8a APK
+```
+
+یعنی درختی که نمی‌توانست بیلد خودش را بازتولید کند. حالا همان چهار کتابخانه از **ریلیز
+همین مخزن** گرفته می‌شوند: هر ریلیزی که این workflow منتشر می‌کند همان چهار فایل را دارد،
+پس جدیدترین تگ همیشه چیزی را دارد که یک checkout قدیمی لازم دارد. `BIGROCKET_BASE` هنوز
+قابل override است.
+
+با پاک کردن کامل `jniLibs/` و `assets/aether/` تست شد: `stage-prebuilt-natives: OK` و ۸
+کتابخانه در جای خود.
