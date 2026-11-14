@@ -94,3 +94,46 @@ armed; UDP stays on Xray, because the client carries TCP only. `XrayPsiphonHopTe
 things that can fail silently: the client always dials its own tunnel *through* the chain (a config
 without `UpstreamProxyURL` would still run, just not through Psiphon), and an empty exit region is
 omitted rather than emitted as `""` (Psiphon treats any `EgressRegion` as a hard filter).
+
+## Hole recovery: three bugs that all looked like "the test is flaky"
+
+An intermittent CI failure in `aStreamSplitAcrossTwoRadiosSurvivesADeadRadio` (it passed
+locally, timed out on the runner) was not flakiness. It was the mux failing to repair a
+hole, and the reason it only showed on a fast machine is that a fast machine is what
+pushes enough data in flight to exhaust the replay cache.
+
+The measurements, in the order they were found:
+
+```
+NACK arrived stream=1 size=10
+resend miss: no cached chunk at 161459 (have 128)
+```
+
+1. **The replay cache was shallower than the receive window.** The far side may legally be
+   `INITIAL_WINDOW` (256 KiB) ahead of the receiver's oldest un-acknowledged chunk - 189
+   chunks of 1394 B - but both ends kept only **128** chunks (`MuxSession.RESEND_CACHE`
+   and the far side's `recentOut`). A hole early in a full window was unfillable: the NACK
+   arrives, the chunk is already evicted, the flow stalls. Both are now derived from the
+   window, `256 KiB / 1394 + 32 = 220` chunks, and the derivation is asserted by a test so
+   the two constants cannot drift again.
+
+2. **A NACK was only sent when a DATA frame arrived.** `drain()` notices a hole and asks for
+   the repair, and it was called from `onData()` alone. If a frame is lost and the sender
+   then fills the window, it stops sending - so no DATA arrives, so no NACK is ever sent.
+   Recovery depended on the link delivering more data, which is exactly what cannot happen.
+   A session watchdog now re-checks open streams every 100 ms.
+
+3. **The NACK budget was per stream, not per hole.** `nackTries` was incremented and never
+   reset, so after `MAX_NACKS = 6` holes anywhere in a tunnel's life the receiver silently
+   stopped requesting repairs. A phone keeps one tunnel open for hours; six lost frames over
+   that time would have permanently disabled repair. It now resets when the hole resolves.
+
+All three are covered by `MuxRetransmitReachTest`, which drops inbound DATA frames on a
+deterministic schedule instead of racing a real socket: one hole, eight holes in one stream,
+and the far side's own `resendMisses` counter asserted to be zero. Reverting either the
+`MuxSession` or the far-side change makes the tests fail, which is how you know they test the
+bug and not themselves.
+
+Result: the suite that failed 3 of 8 runs before the fixes passes **10 of 10** consecutive
+runs after them, and the measured bandwidth is unchanged (2 radio = 16.10-16.78 Mbps against
+1 radio = 8.05-8.31 Mbps, speedup 2.00-2.02x).
