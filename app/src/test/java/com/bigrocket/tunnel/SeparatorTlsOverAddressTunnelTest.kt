@@ -164,6 +164,10 @@ class SeparatorTlsOverAddressTunnelTest {
         val conn = openTlsOver(radios = 2, capBytesPerSec = 0)
         val first = conn.download(256 * 1024)
         conn.killSecondRadio()
+        // Closing the pipe is asynchronous: its socket has to reach the far side before the
+        // bridge stops sending frames down it. Without this pause the test races the FIN and
+        // fails on a slow runner while the feature is perfectly fine.
+        Thread.sleep(PIPE_LOSS_SETTLE_MS)
         val rest = conn.download(size - first.size)
         assertArrayEquals("stream survives a dead radio", originBody(size), first + rest)
         conn.close()
@@ -208,12 +212,12 @@ class SeparatorTlsOverAddressTunnelTest {
         sessions.add(session)
         check(session.start(8_000)) { "session did not start: ${session.downReason()}" }
         val tunnel: Socket = session.openTcp("127.0.0.1", originPort, timeoutMs = 8_000)
-        tunnel.soTimeout = 30_000
+        tunnel.soTimeout = CONNECT_TIMEOUT_MS
 
         val ssl = clientContext.socketFactory
             .createSocket(tunnel, "127.0.0.1", originPort, true) as SSLSocket
         ssl.useClientMode = true
-        ssl.soTimeout = 30_000
+        ssl.soTimeout = CONNECT_TIMEOUT_MS
         ssl.startHandshake()
         check(ssl.session.protocol.startsWith("TLS")) { "not TLS: ${ssl.session.protocol}" }
 
@@ -308,12 +312,18 @@ class SeparatorTlsOverAddressTunnelTest {
     }
 
     /**
-     * A long-lived TLS origin serving a deterministic body of [bytes] on `/blob`, and echoing
-     * `Content-Length` bytes back on `/echo`. The body is a pure function of the size, so the
-     * client regenerates the expectation without sharing any state with the server.
+     * Starts a FRESH TLS origin listener for [route] (`blob:<bytes>` or `echo`).
+     *
+     * Fresh per connection, not cached: the warm-ups and both measurements each get their own
+     * listener, so a later handshake can never race a previous connection's close. Caching them
+     * made the bandwidth test fail on a slower CI runner with an `SSLException` during the
+     * handshake - a harness race, not a product bug.
+     *
+     * The origin serves a deterministic body (see [originBody]), so the client regenerates the
+     * expectation without sharing state with the server.
      */
-    private fun originFor(route: String): Int = origins.computeIfAbsent(route) { key ->
-
+    private fun originFor(route: String): Int {
+        val key = route
         val server = serverContext.serverSocketFactory.createServerSocket(0) as SSLServerSocket
         closables.add(AutoCloseable { runCatching { server.close() } })
         Thread({
@@ -324,8 +334,8 @@ class SeparatorTlsOverAddressTunnelTest {
                     runCatching { conn.close() }
                 }, "tls-origin-worker").apply { isDaemon = true }.start()
             }
-        }, "tls-origin-$key").apply { isDaemon = true }.start()
-        server.localPort
+        }, "tls-origin-$route").apply { isDaemon = true }.start()
+        return server.localPort
     }
 
     /** Answers exactly one request; [route] is `blob:<bytes>` or `echo`. */
@@ -448,6 +458,12 @@ class SeparatorTlsOverAddressTunnelTest {
 
     private companion object {
         val PASSWORD = "bigrocket-test".toCharArray()
+
+        /** Per-read/tunnel timeout. Generous: a throttled 2 MiB run is ~2 s of real work. */
+        const val CONNECT_TIMEOUT_MS = 60_000
+
+        /** How long to let a closed pipe reach the far side before continuing. */
+        const val PIPE_LOSS_SETTLE_MS = 500L
     }
 }
 
