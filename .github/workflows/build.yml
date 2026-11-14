@@ -225,13 +225,37 @@ jobs:
           TAG="v${VERSION}-b${CODE}"
           NOTES="BigRocket ${VERSION} (versionCode ${CODE}) - address tunnel.
 
+          PSIPHON IS NOW AVAILABLE IN THE Direct + Xray MODE, not only Direct + Aether.
+          Xray's core has no --psiphon switch, so the hop is a standalone libpsiphon.so
+          listening on 127.0.0.1:1821 as the ENTRY of the chain and dialling Xray on :1839
+          through UpstreamProxyURL:
+
+            TUN/hev -> psiphon 127.0.0.1:1821 -> socks5 -> Xray :1839 -> outbound
+                    (dialerProxy=bonding-chain) -> network
+
+          Off by default, region automatic by default, optional country from ExitRegions.
+          UDP and DNS stay on Xray; a Psiphon local proxy is TCP only. Each chain is owned
+          by exactly one mechanism - XrayPsiphonHop for Direct + Xray, the engine's own
+          PsiphonHop for every chain containing Aether - so no chain can get two hops.
+
+          THREE TUNNEL BUGS FIXED (all of them "the flow dies and never recovers"):
+            1. The replay cache was shallower than the receive window (128 chunks kept vs
+               189 needed), so a hole early in a fast burst could never be filled. Both
+               ends now derive the depth from the window.
+            2. A NACK was only sent when a DATA frame arrived. If a frame was lost and the
+               sender then filled the window, it stopped sending - so no repair was ever
+               asked for. A watchdog now re-checks open streams every 100 ms.
+            3. The NACK budget was counted per stream, not per hole, so after six holes
+               anywhere in a tunnel's life repairs stopped entirely. It resets per hole.
+
           ONE TLS STREAM OVER TWO RADIOS (measured, SeparatorTlsOverAddressTunnelTest):
-            1 radio  =  8.25 Mbps (2033 ms)
-            2 radios = 16.13 Mbps (1040 ms)   ->  1.95x, radios used 2/2
+            1 radio  =  8.05 Mbps (2083 ms)
+            2 radios = 16.10 Mbps (1042 ms)   ->  2.00x, radios used 2/2
           A real TLS 1.3 connection is fragmented by the address tunnel, carried over Wi-Fi
           and cellular at once, reassembled and verified byte-for-byte - no CA, no
           interception. Each radio is capped at 1 MB/s in the test so the radios, not
-          loopback, are the bottleneck.
+          loopback, are the bottleneck. The two-radio TLS suite failed 3 of 8 runs before
+          the tunnel fixes and passes 10 of 10 after them; bandwidth is unchanged.
 
           Two architectures in one release:
             BigRocket-arm64-v8a.apk    - 64-bit ARM (most phones from 2017 on)
@@ -240,8 +264,11 @@ jobs:
           Install the one that matches the phone. If unsure, the armeabi-v7a build also
           runs on 64-bit devices.
 
-          Full notes: docs/TwoRadiosOneTlsStream.md and docs/RELEASE-1.6-address-tunnel.md
-          in the source tree. Test suite: 24 suites / 212 tests."
+          Full notes: docs/PsiphonOverXray-fa.md, docs/TwoRadiosOneTlsStream.md and
+          docs/RELEASE-1.6-address-tunnel.md in the source tree.
+          Test suite: 25 suites / 226 tests. A live connection to the Psiphon network is
+          not covered by the tests - it needs a handset. Look for the log line
+          'psiphon stage live on 127.0.0.1:1821 -> 1839' on first run."
           if [ "${TEST_KEY:-0}" = "1" ]; then
             NOTES="$NOTES
 

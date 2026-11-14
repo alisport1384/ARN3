@@ -16,15 +16,15 @@ Every number below was printed by a test in `app/src/test/java`, on this tree, w
 Yes, and roughly **twice as fast**:
 
 ```
-[measure] single TLS stream, 2048 KiB: 1 radio = 8.25 Mbps (2033ms),
-          2 radios = 16.13 Mbps (1040ms), speedup = 1.95x, radios used = 2/2
+[measure] single TLS stream, 2048 KiB: 1 radio = 8.05 Mbps (2084ms),
+          2 radios = 16.61 Mbps (1010ms), speedup = 2.06x, radios used = 2/2
 ```
 
 * 2 MiB downloaded through a **real TLS 1.3 connection** whose bytes are fragmented, spread over two
   carrier pipes, re-ordered and reassembled — and verified byte-for-byte against the origin.
 * Each radio is throttled to 1 MB/s so the radios, not loopback, are the bottleneck. With one pipe
   the stream cannot exceed that rate; with two it approaches double.
-* Repeated runs: **1.95× – 2.01×** (16.13 – 16.16 Mbps on two radios). The variation is JIT and
+* Repeated runs: **1.98× – 2.06×** (16.10 – 16.78 Mbps on two radios). The variation is JIT and
   scheduling noise, not a behaviour change.
 
 ## The bug that made it impossible before
@@ -72,7 +72,7 @@ The other three fixes in this series, all required for the same end:
 | `BitStreamSeparatorTest` | Bit-exact split/merge at every share 1..99 %, CRC rejection of a flipped bit, out-of-order/duplicate/beyond-window/NACK-timeout merge cases. |
 | `VirtualSeparatorSocketTest` | Real dual-`ServerSocket` HTTP Range server: one GET split across two radios, `206` handling, dead-radio failover, mid-slice worker death, passthrough cases. |
 
-Whole suite: **24 suites / 212 tests, 0 failures.**
+Whole suite: **26 suites / 226 tests, 0 failures.**
 
 ## Honest scope
 

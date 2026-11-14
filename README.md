@@ -19,15 +19,16 @@ Measured, in `SeparatorTlsOverAddressTunnelTest`, on a real TLS 1.3 connection w
 throttled to 1 MB/s:
 
 ```
-single TLS stream, 2048 KiB: 1 radio = 8.25 Mbps (2033ms),
-                             2 radios = 16.13 Mbps (1040ms), speedup = 1.95x, radios used = 2/2
+single TLS stream, 2048 KiB: 1 radio = 8.05 Mbps (2084ms),
+                             2 radios = 16.61 Mbps (1010ms), speedup = 2.06x, radios used = 2/2
 ```
 
 ## Documentation
 
 | Document | Contents |
 |---|---|
-| [`docs/TwoRadiosOneTlsStream.md`](docs/TwoRadiosOneTlsStream.md) | The TLS-over-two-radios work: the five defects that blocked it, the fix for each, and the numbers |
+| [`docs/TwoRadiosOneTlsStream.md`](docs/TwoRadiosOneTlsStream.md) | The TLS-over-two-radios work: the five defects that blocked it, then the three hole-recovery bugs that hid behind a flaky test, and the numbers |
+| [`docs/PsiphonOverXray-fa.md`](docs/PsiphonOverXray-fa.md) | Psiphon in the Direct + Xray chain: topology, why Xray alone owns the stage, port table, lifecycle (Persian) |
 | [`docs/VirtualSeparator.md`](docs/VirtualSeparator.md) | The virtual separator: architecture, files, where it hooks into the data plane, honest limits |
 | [`docs/RELEASE-1.6-address-tunnel.md`](docs/RELEASE-1.6-address-tunnel.md) | Release notes for this version, including how to install |
 | [`docs/AddressTunnel.md`](docs/AddressTunnel.md) | The address tunnel protocol and the far-side bridge |
@@ -35,7 +36,7 @@ single TLS stream, 2048 KiB: 1 radio = 8.25 Mbps (2033ms),
 ## Building
 
 ```bash
-./gradlew :app:testDebugUnitTest -PbrAbis=armeabi-v7a      # 24 suites / 212 tests
+./gradlew :app:testDebugUnitTest -PbrAbis=armeabi-v7a      # 26 suites / 226 tests
 ./gradlew :app:assembleRelease    -PbrAbis=arm64-v8a,armeabi-v7a
 ```
 

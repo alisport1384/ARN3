@@ -52,8 +52,8 @@ with no VPS, no BridgeServer and no remote peer. Everything below happens inside
    end-to-end and is never intercepted — no CA, no MITM — yet still uses both radios.
    Measured in `SeparatorTlsOverAddressTunnelTest` (real TLS 1.3 handshake against a real
    `BridgeServer`, both directions byte-exact, each radio throttled to 1 MB/s): a single 2 MiB TLS
-   stream ran at **8.25 Mbps on one radio and 16.13 Mbps on two — 1.95×**, with
-   `radios used = 2/2`. Repeated runs land between 1.95× and 2.01× (16.13–16.16 Mbps on two). The limit is real but
+   stream ran at **8.05 Mbps on one radio and 16.61 Mbps on two — 2.06×**, with
+   `radios used = 2/2`. Repeated runs land between 1.98× and 2.06× (16.10–16.78 Mbps on two). The limit is real but
    narrower than "HTTPS is not split": what is *not* split is one TLS *record boundary* per
    HTTP-range slice; the byte stream underneath it is.
 2. Servers that ignore `Range` (`200 OK`) are streamed verbatim — the engine never re-writes
@@ -66,7 +66,7 @@ with no VPS, no BridgeServer and no remote peer. Everything below happens inside
 
 ## Verification
 
-* `./gradlew :app:testDebugUnitTest -PbrAbis=armeabi-v7a` — 24 suites / 212 tests, all green, of
+* `./gradlew :app:testDebugUnitTest -PbrAbis=armeabi-v7a` — 26 suites / 226 tests, all green, of
   which 44 are new: `BitStreamSeparatorTest` (bit-exact 1..99 percent, `BSB1` round trip, flipped-bit CRC rejection,
   out-of-order/duplicate/beyond-window/NACK-timeout merger cases) and
   `VirtualSeparatorSocketTest` (real dual-`ServerSocket` HTTP Range server: one GET split across two
@@ -76,8 +76,8 @@ with no VPS, no BridgeServer and no remote peer. Everything below happens inside
   client handshakes through the address tunnel and its records are carried over **both** radios —
   512 KiB down + up byte-exact, a 2 MiB multi-chunk download byte-exact, a 1 MiB stream that
   survives a radio dying mid-download, and the bandwidth test that prints
-  `[measure] single TLS stream, 2048 KiB: 1 radio = 8.25 Mbps (2033ms), 2 radios = 16.13 Mbps
-  (1040ms), speedup = 1.95x, radios used = 2/2`.
+  `[measure] single TLS stream, 2048 KiB: 1 radio = 8.05 Mbps (2084ms), 2 radios = 16.61 Mbps
+  (1010ms), speedup = 2.06x, radios used = 2/2`.
 * `MuxOrderingUnderTwoCarriersTest` guards the concurrency bug that used to corrupt exactly these
   downloads: two carrier threads feeding `MuxSession` at once with inverted arrival order. It fails
   when `MuxSession.drain()` is not serialised and passes when it is. Context: before the fix a
