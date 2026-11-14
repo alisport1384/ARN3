@@ -50,6 +50,7 @@ import com.bigrocket.network.DnsConfig
 import com.bigrocket.network.DnsConfigStore
 import com.bigrocket.service.EmbeddedAetherRuntime
 import com.bigrocket.service.PsiphonHop
+import com.bigrocket.service.XrayPsiphonHop
 import com.bigrocket.service.UpstreamHealth
 import com.bigrocket.service.UpstreamLevel
 import com.bigrocket.service.XrayConfigBuilder
@@ -927,12 +928,23 @@ class MainActivity : AppCompatActivity() {
             upstreamChoice == UpstreamChoice.XRAY_AETHER
         xrayConfigSection.visibility = if (usesXray) View.VISIBLE else View.GONE
 
-        // The optional Psiphon hop exists in exactly the chains that contain Aether.
-        // A chain without Aether must neither show the switch nor keep a saved "on"
-        // armed: PsiphonHop.effective() already forces OFF for those chains, and the
-        // UI mirrors that by syncing the controls to the effective value.
-        psiphonHopSection.visibility = if (usesAether) View.VISIBLE else View.GONE
-        syncPsiphonHopControls(PsiphonHop.effective(this, upstreamChoice))
+        // The optional Psiphon hop exists in every chain that has a stage to hang it on:
+        //   - Aether chains: the engine runs its own in-tunnel Psiphon stage (PsiphonHop);
+        //   - Xray-outermost chains (Direct+Xray, Direct+Aether+Xray): this app runs the
+        //     client itself and chains it in front of Xray (XrayPsiphonHop).
+        // NONE has no proxy stage at all, so it must not show the switch.
+        val hopSupported = PsiphonHop.appliesTo(upstreamChoice) ||
+            XrayPsiphonHop.appliesTo(upstreamChoice)
+        psiphonHopSection.visibility = if (hopSupported) View.VISIBLE else View.GONE
+        // The saved switch is shared by both chains (one user intent, two mechanisms).
+        // effective() reflects whether THIS chain can honour it.
+        syncPsiphonHopControls(
+            if (PsiphonHop.appliesTo(upstreamChoice)) {
+                PsiphonHop.effective(this, upstreamChoice)
+            } else {
+                XrayPsiphonHop.effective(this, upstreamChoice)
+            },
+        )
     }
 
     /**
@@ -988,7 +1000,9 @@ class MainActivity : AppCompatActivity() {
         }
         psiphonHop = normalized
         psiphonRegionRow.visibility = if (normalized.enabled) View.VISIBLE else View.GONE
+        val outerIsXray = XrayPsiphonHop.appliesTo(loadUpstreamChoice())
         tvPsiphonHopStatus.text = when {
+            !normalized.enabled && outerIsXray -> "خاموش — ترافیک فقط از تونل Xray بیرون می‌رود"
             !normalized.enabled -> "خاموش — ترافیک فقط از تونل Aether بیرون می‌رود"
             normalized.region.isEmpty() ->
                 "روشن — خروجی: خودکار (بهترین انتخاب Psiphon)"

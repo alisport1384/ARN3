@@ -36,6 +36,31 @@ import studio.cluvex.aether.core.TunnelConfig
  */
 internal object AetherEntry {
 
+    /**
+     * Same question for the `direct + xray` (and `aether + xray`) chains, where the outer
+     * stage is Xray rather than Aether and the Psiphon client is our own process
+     * ([XrayPsiphonHop]) rather than an engine stage.
+     *
+     * When it is armed and live, TCP must enter the chain at the Psiphon client's listener
+     * (1821) - that is what makes the exit a Psiphon exit - and the client's own dials are
+     * carried by Xray, which is carried by the bonding boundary. UDP stays on Xray
+     * ([EmbeddedXrayRuntime.SOCKS_PORT]) for the same reason as above: the client has no
+     * UDP ASSOCIATE, so pointing DNS at it would break every lookup.
+     */
+    @Volatile var xrayPsiphonLive: Boolean = false
+        private set
+
+    /** The port the TUN-side consumer must dial for the Xray-outermost chains. */
+    @Volatile var xrayPsiphonPort: Int = 0
+        private set
+
+    /** Publishes the Xray-chain entry. [hopPort] is 0 when the hop is not live. */
+    fun updateXrayPsiphon(hopLive: Boolean, hopPort: Int = XrayPsiphonHop.SOCKS_PORT) {
+        xrayPsiphonLive = hopLive
+        xrayPsiphonPort = if (hopLive) hopPort else 0
+    }
+
+
     /** Port for every TCP flow that must leave through the active chain. */
     @Volatile var tcpPort: Int = TunnelConfig.SOCKS_PORT
         private set

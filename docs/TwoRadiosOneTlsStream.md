@@ -81,3 +81,16 @@ Whole suite: **24 suites / 212 tests, 0 failures.**
   *below* TLS by the address tunnel instead. No CA, no interception.
 * The two throttles in the bandwidth test are a model of two comparable radios, not a simulation of
   LTE latency, loss, or a handover. Real-radio numbers have to be measured on a handset.
+
+## Also in this release: Psiphon in the Direct + Xray chain
+
+The Psiphon stage used to exist only where Aether does, because the Aether engine runs it
+internally (`aether --psiphon`). Xray has no such stage, so in `direct + xray` the app now runs
+the psiphon-tunnel-core client itself and chains it **in front of** Xray — see
+[`PsiphonOverXray-fa.md`](PsiphonOverXray-fa.md).
+
+The chain's TCP entry moves from Xray's listener (1839) to the client's (1821) while the stage is
+armed; UDP stays on Xray, because the client carries TCP only. `XrayPsiphonHopTest` pins the two
+things that can fail silently: the client always dials its own tunnel *through* the chain (a config
+without `UpstreamProxyURL` would still run, just not through Psiphon), and an empty exit region is
+omitted rather than emitted as `""` (Psiphon treats any `EgressRegion` as a hard filter).

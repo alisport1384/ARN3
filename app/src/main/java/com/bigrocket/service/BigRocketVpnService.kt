@@ -384,6 +384,9 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
             AppLogger.log("VpnService", "Xray ready - starting Aether stage of Direct+Xray+Aether chain")
             startAetherIfNeeded(upstreamPort = EmbeddedXrayRuntime.SOCKS_PORT)
         }
+        // The chains whose outermost stage is Xray own the client-based Psiphon hop; it can
+        // only be started once Xray is actually serving, because the client dials it.
+        if (isRunning && xrayReady) ensureXrayOuterPsiphonStage(choice)
         val (chainMode, chainReady) = currentChainState(aetherReady, xrayReady)
         applyUpstreamMode(chainReady, chainMode)
     }
@@ -492,8 +495,17 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
         val wantHev = chainReady && chainMode != UpstreamMode.NONE && HevTunnel.isAvailable()
         // hev forwards everything to exactly ONE local SOCKS target - the entry point
         // of the active chain: Xray's listener for both Xray chains, Aether's otherwise.
-        val hevSocksPort =
-            if (chainMode == UpstreamMode.XRAY) EmbeddedXrayRuntime.SOCKS_PORT else AetherEntry.tcpPort
+        //  For the Xray-outermost chains the hop sits IN FRONT of Xray: its listener is the
+        //  chain's entry, and it dials Xray itself. Entering Xray directly would leave the
+        //  chain working but exiting through the user's outbound instead of Psiphon - the
+        //  switch would look broken while every stage was healthy (same trap as AetherEntry's
+        //  doc describes for the Aether chain).
+        val hevSocksPort = when {
+            chainMode == UpstreamMode.XRAY && AetherEntry.xrayPsiphonLive ->
+                AetherEntry.xrayPsiphonPort
+            chainMode == UpstreamMode.XRAY -> EmbeddedXrayRuntime.SOCKS_PORT
+            else -> AetherEntry.tcpPort
+        }
         if (wantHev == usingHevEngine && (!usingHevEngine || hevSocksPort == activeHevSocksPort)) {
             // Same engine as before: for the JVM router this still needs the mode flag
             // applied (chain mode when ready but hev unavailable, e.g. native bridge failed
@@ -848,6 +860,9 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
         when (choice) {
             EmbeddedAetherRuntime.UpstreamChoice.AETHER -> {
                 stopXrayIfRunning("choice=AETHER")
+                // Aether is outermost here and runs its own in-engine Psiphon stage; the
+                // Xray-chain client must not be left holding port 1821 in front of it.
+                stopXrayPsiphonIfRunning("choice=AETHER")
                 if (EmbeddedAetherRuntime.needsRestart(BondingSocksServer.PORT) ||
                     EmbeddedAetherRuntime.hopNeedsRestart(applicationContext)
                 ) {
@@ -859,13 +874,37 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
                 // Direct + Xray: Xray's outbound dials straight through the bonding
                 // boundary; Aether plays no part in this chain.
                 stopAetherIfRunning("choice=XRAY")
+                val hop = XrayPsiphonHop.effective(applicationContext, choice)
+                if (!hop.enabled) {
+                    // Hop off: make sure a client from an earlier launch cannot keep the
+                    // chain's entry port (or the Psiphon datastore lock) hostage.
+                    if (XrayPsiphonHop.isRunning()) {
+                        XrayPsiphonHop.stop("hop disabled")
+                        AetherEntry.updateXrayPsiphon(false)
+                        refreshUpstreamModeForEntryChange()
+                    }
+                }
                 if (EmbeddedXrayRuntime.needsRestart(applicationContext, BondingSocksServer.PORT)) {
                     AppLogger.log("VpnService", "applyUpstreamChoice: restarting Xray (stale chain/config)")
                     EmbeddedXrayRuntime.stop()
+                    // The client dials Xray, so it cannot outlive a restart of it.
+                    XrayPsiphonHop.stop("Xray stage restarting underneath")
+                    AetherEntry.updateXrayPsiphon(false)
                 }
                 if (!EmbeddedXrayRuntime.isRunning()) {
                     AppLogger.log("VpnService", "applyUpstreamChoice: starting Xray (Direct + Xray)")
                     EmbeddedXrayRuntime.start(applicationContext, chainPort = BondingSocksServer.PORT)
+                }
+                if (hop.enabled && !XrayPsiphonHop.isRunning()) {
+                    // Starts the client (which dials Xray's listener) and waits for its
+                    // listener: the entry port only flips once the stage really serves.
+                    AppLogger.log("VpnService", "applyUpstreamChoice: starting the Psiphon stage of Direct + Xray")
+                    XrayPsiphonHop.start(applicationContext, upstreamPort = EmbeddedXrayRuntime.SOCKS_PORT)
+                    val live = XrayPsiphonHop.isRunning()
+                    AetherEntry.updateXrayPsiphon(live)
+                    if (live) refreshUpstreamModeForEntryChange()
+                } else if (hop.enabled) {
+                    AetherEntry.updateXrayPsiphon(true)
                 }
             }
             EmbeddedAetherRuntime.UpstreamChoice.AETHER_XRAY -> {
@@ -891,8 +930,10 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
                     AppLogger.log("VpnService", "applyUpstreamChoice: starting Xray (Direct + Aether + Xray)")
                     EmbeddedXrayRuntime.start(applicationContext, chainPort = AetherEntry.tcpPort)
                 }
+                ensureXrayOuterPsiphonStage(choice)
             }
             EmbeddedAetherRuntime.UpstreamChoice.XRAY_AETHER -> {
+                stopXrayPsiphonIfRunning("choice=XRAY_AETHER")
                 // Direct + Xray + Aether: exact mirror of AETHER_XRAY. Xray first,
                 // chained straight to the bonding boundary; Aether is launched by
                 // onChainReadinessChanged() the moment Xray reports trafficReady,
@@ -923,8 +964,56 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
             EmbeddedAetherRuntime.UpstreamChoice.NONE -> {
                 stopXrayIfRunning("choice=NONE")
                 stopAetherIfRunning("choice=NONE")
+                stopXrayPsiphonIfRunning("choice=NONE")
             }
         }
+    }
+
+    /**
+     * Starts or stops the Xray-chain Psiphon stage to match the live chain.
+     *
+     * Only the chains whose OUTERMOST stage is Xray own this hop ([XrayPsiphonHop.appliesTo]);
+     * everywhere else Aether's own in-engine stage is the hop and this client must be off.
+     * Called after the chain's stages are up, never before: the client dials Xray.
+     */
+    private fun ensureXrayOuterPsiphonStage(choice: EmbeddedAetherRuntime.UpstreamChoice) {
+        val hop = XrayPsiphonHop.effective(applicationContext, choice)
+        val xrayUp = EmbeddedXrayRuntime.isRunning()
+        if (hop.enabled && xrayUp) {
+            if (!XrayPsiphonHop.isRunning() || XrayPsiphonHop.needsRestart(applicationContext)) {
+                XrayPsiphonHop.start(applicationContext, upstreamPort = EmbeddedXrayRuntime.SOCKS_PORT)
+            }
+            val live = XrayPsiphonHop.isRunning()
+            AetherEntry.updateXrayPsiphon(live)
+            if (live && AetherEntry.xrayPsiphonPort != activeHevSocksPort) {
+                refreshUpstreamModeForEntryChange()
+            }
+        } else if (!hop.enabled && XrayPsiphonHop.isRunning()) {
+            XrayPsiphonHop.stop("hop disabled")
+            AetherEntry.updateXrayPsiphon(false)
+            refreshUpstreamModeForEntryChange()
+        }
+    }
+
+    /**
+     * Re-applies the TUN engine against the current chain entry.
+     *
+     * Called whenever the chain's ENTRY PORT changes without the chain itself changing - the
+     * `direct + xray` Psiphon stage coming up or going down moves traffic from Xray's
+     * listener (1839) to the client's (1821) or back. `hev` reads its SOCKS target once at
+     * start, so a moved entry needs it restarted against the new port; this mirrors what
+     * `applyUpstreamChoice` does with the values it already has locally.
+     */
+    private fun refreshUpstreamModeForEntryChange() {
+        val (mode, ready) = currentChainState()
+        applyUpstreamModeLocked(ready, mode)
+    }
+
+    /** Stops the Xray-chain Psiphon client and puts the entry port back. */
+    private fun stopXrayPsiphonIfRunning(reason: String) {
+        if (!XrayPsiphonHop.isRunning()) return
+        XrayPsiphonHop.stop(reason)
+        AetherEntry.updateXrayPsiphon(false)
     }
 
     private suspend fun startAetherIfNeeded(upstreamPort: Int = BondingSocksServer.PORT) {
@@ -943,6 +1032,9 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
     }
 
     private fun stopXrayIfRunning(reason: String) {
+        // The Xray-chain Psiphon client dials Xray's listener; leaving it up while Xray is
+        // gone would keep the chain's entry port pointing at an orphan.
+        stopXrayPsiphonIfRunning(reason)
         if (EmbeddedXrayRuntime.isRunning()) {
             AppLogger.log("VpnService", "applyUpstreamChoice: stopping Xray ($reason)")
             EmbeddedXrayRuntime.stop()
