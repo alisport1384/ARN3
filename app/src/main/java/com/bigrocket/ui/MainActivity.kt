@@ -61,6 +61,9 @@ import com.bigrocket.R
 import com.bigrocket.service.BigRocketVpnService
 import com.bigrocket.service.BondingMode
 import com.bigrocket.service.BondingStatus
+import com.bigrocket.separator.VirtualSeparatorProbe
+import com.bigrocket.separator.VirtualSeparatorRuntime
+import com.bigrocket.separator.VirtualSeparatorStore
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
@@ -123,6 +126,11 @@ class MainActivity : AppCompatActivity() {
     private lateinit var etDnsAddress: android.widget.EditText
     private lateinit var btnSaveDnsAddress: Button
     private lateinit var tvEgressIp: TextView
+    // Virtual separator engine card (see com.bigrocket.separator): bit-by-bit split of a
+    // SINGLE TCP stream across both radios, reassembled inside the phone - no server needed.
+    private lateinit var switchVirtualSeparator: androidx.appcompat.widget.SwitchCompat
+    private lateinit var tvVirtualSeparatorStatus: TextView
+    private lateinit var btnVirtualSeparatorTest: Button
     private var upstreamChoice = UpstreamChoice.NONE
     // Backed by Compose state (not a plain var): AetherEmbeddedPanel reads this inside
     // aetherEmbeddedPanel.setContent{}, so a plain var mutation here was invisible to Compose -
@@ -258,9 +266,93 @@ class MainActivity : AppCompatActivity() {
         btnSaveTunnelAddress = findViewById(R.id.btnSaveTunnelAddress)
         btnClearTunnelAddress = findViewById(R.id.btnClearTunnelAddress)
         tvTunnelStatus = findViewById(R.id.tvTunnelStatus)
+        switchVirtualSeparator = findViewById(R.id.switchVirtualSeparator)
+        tvVirtualSeparatorStatus = findViewById(R.id.tvVirtualSeparatorStatus)
+        btnVirtualSeparatorTest = findViewById(R.id.btnVirtualSeparatorTest)
         setupStaticProxyControls()
         setupTunnelControls()
         setupDnsControls()
+        setupVirtualSeparatorControls()
+        observeVirtualSeparatorStatus()
+    }
+
+    /**
+     * The Virtual Separator Engine card ("موتور جداکننده مجازی").
+     *
+     * The switch persists the operator's choice and publishes it to
+     * [VirtualSeparatorRuntime], which every egress point reads per new flow - so turning it
+     * off never tears down the tunnel, it only stops NEW streams from being split (already
+     * separated streams finish on their own). The test button runs the real proof:
+     * 256 KiB separated into 2,097,152 individual bits across two concurrent workers with
+     * out-of-order arrivals, verified byte-for-byte, followed by a live single-stream
+     * dual-radio download when both radios (and the VPN) are up.
+     */
+    private fun setupVirtualSeparatorControls() {
+        VirtualSeparatorStore.hydrate(this)
+        val enabled = VirtualSeparatorStore.load(this)
+        switchVirtualSeparator.setOnCheckedChangeListener(null)
+        switchVirtualSeparator.isChecked = enabled
+        switchVirtualSeparator.setOnCheckedChangeListener { _, checked ->
+            VirtualSeparatorStore.save(this, checked)
+            VirtualSeparatorRuntime.setEnabled(checked)
+            AppLogger.log("UI", "virtual separator enabled=$checked")
+            Toast.makeText(
+                this,
+                if (checked) {
+                    "موتور جداکننده مجازی روشن شد: پیلود یک اتصال بین Wi-Fi و دیتا تفکیک می‌شود"
+                } else {
+                    "موتور جداکننده مجازی خاموش شد: هر اتصال فقط از یک مسیر می‌رود"
+                },
+                Toast.LENGTH_SHORT,
+            ).show()
+        }
+
+        btnVirtualSeparatorTest.setOnClickListener {
+            btnVirtualSeparatorTest.isEnabled = false
+            val service = BigRocketVpnService.runningInstance
+            lifecycleScope.launch {
+                try {
+                    val report = VirtualSeparatorProbe.runLiveDualRadioTest(
+                        vpnService = service,
+                        wifi = service?.sandboxWifiNetwork(),
+                        cellular = service?.sandboxCellularNetwork(),
+                    )
+                    AppLogger.log("UI", "virtual separator test: ${report.note}")
+                    android.app.AlertDialog.Builder(this@MainActivity)
+                        .setTitle("نتیجه تست جداکننده مجازی")
+                        .setMessage(report.formatPersian())
+                        .setPositiveButton("باشه", null)
+                        .show()
+                } catch (e: Exception) {
+                    AppLogger.log("UI", "virtual separator test failed: ${e.javaClass.simpleName}: ${e.message}")
+                    Toast.makeText(
+                        this@MainActivity,
+                        "تست ناموفق بود: ${e.message ?: e.javaClass.simpleName}",
+                        Toast.LENGTH_LONG,
+                    ).show()
+                } finally {
+                    btnVirtualSeparatorTest.isEnabled = true
+                }
+            }
+        }
+    }
+
+    /** Mirrors [VirtualSeparatorRuntime.status] into the card on every publish. */
+    private fun observeVirtualSeparatorStatus() {
+        lifecycleScope.launch {
+            VirtualSeparatorRuntime.status.collectLatest { status ->
+                if (!::switchVirtualSeparator.isInitialized) return@collectLatest
+                if (switchVirtualSeparator.isChecked != status.enabled) {
+                    switchVirtualSeparator.setOnCheckedChangeListener(null)
+                    switchVirtualSeparator.isChecked = status.enabled
+                    switchVirtualSeparator.setOnCheckedChangeListener { _, checked ->
+                        VirtualSeparatorStore.save(this@MainActivity, checked)
+                        VirtualSeparatorRuntime.setEnabled(checked)
+                    }
+                }
+                tvVirtualSeparatorStatus.text = status.summary()
+            }
+        }
     }
 
     /**

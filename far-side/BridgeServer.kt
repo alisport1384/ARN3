@@ -327,6 +327,20 @@ class Router(private val log: (String) -> Unit) {
         return false
     }
 
+    /**
+     * Answers a frame on the pipe it arrived on.
+     *
+     * Only stream-scoped frames may be round-robined ([send]). A PING/PONG or HELLO_ACK sent
+     * over *a different* pipe than the one that asked looks to a strict client like a lost
+     * handshake: the phone's keep-alive would go unanswered on the pipe that sent it, and a
+     * fresh session would retry HELLO on the other radio while its ACK trickled in on the first.
+     */
+    fun replyOn(pipe: Pipe?, type: Int, payload: ByteArray): Boolean {
+        val direct = pipe ?: return send(type, payload)
+        val frame = BrtWire.encode(type, sequence.getAndIncrement(), cookie, payload)
+        return direct.send(frame) || send(type, payload)
+    }
+
     /** Send to one specific pipe (used for replies that must come back on that pipe first). */
     fun sendOn(pipe: Pipe?, type: Int, payload: ByteArray): Boolean {
         val direct = pipe ?: return send(type, payload)
@@ -376,7 +390,14 @@ class Stream(
             if (offset + data.size <= writeOffset) return
             val start = maxOf(offset, writeOffset)
             val skip = (start - offset).toInt()
-            inbound[start] = if (skip > 0) data.copyOfRange(skip, data.size) else data
+            val slice = if (skip > 0) data.copyOfRange(skip, data.size) else data
+            // IDEMPOTENT. Two radios mean holes are normal, and a hole makes the phone
+            // re-send the range while the original is still in flight. Overwriting the entry
+            // is safe; *duplicating* it is not - the duplicate would be written to the real
+            // socket a second time and the destination would see corrupted bytes (a TLS
+            // stream dies with "Illegal packet size" / AEAD tag mismatch at exactly this spot).
+            if (inbound.containsKey(start)) return
+            inbound[start] = slice
             (lock as Object).notifyAll()
         }
     }
@@ -906,7 +927,7 @@ class BridgeServer(
      */
     private fun handle(type: Int, payload: ByteArray, pipe: Pipe, pipeCookie: Int = cookie) {
         when (type) {
-            BrtWire.PING -> router.sendOn(pipe, BrtWire.PONG, payload)
+            BrtWire.PING -> router.replyOn(pipe, BrtWire.PONG, payload)
 
             BrtWire.HELLO -> {
                 // A new session announced itself.
@@ -936,7 +957,7 @@ class BridgeServer(
                     router.remove(dead)
                     log("retired stale udp peer ${dead.label} (session $tag)")
                 }
-                router.sendOn(pipe, BrtWire.HELLO_ACK, payload)
+                router.replyOn(pipe, BrtWire.HELLO_ACK, payload)
             }
 
             BrtWire.OPEN -> {

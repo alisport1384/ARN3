@@ -39,13 +39,32 @@ GOOD_GO_MARKER="go1.26"
 UPSTREAM_BASE="${UPSTREAM_BASE:-https://github.com/QW-AI-Code/Aether/releases/download/v1.6.0-build.25}"
 UPSTREAM_APK="Aether-1.6.0-%s.apk"
 
-# Libraries taken from the upstream APK. libaether.so is NOT in this list: it is built
-# here from source, and only used as an asset fallback further down.
+# BigRocket's own published per-ABI APK. It is the authoritative carrier of the four
+# engine libraries for EVERY ABI, including armeabi-v7a: upstream Aether's release only
+# ships arm64-v8a, and its libhev-socks5-tunnel.so is a different build whose JNI_OnLoad
+# expects `hev.htproxy.TProxyService` - loading it inside BigRocket crashes the process
+# on the first tunnel start. So the hev/xray/aethertun binaries are taken from here, never
+# from the upstream APK.
+BIGROCKET_BASE="${BIGROCKET_BASE:-https://github.com/alisport1384/ARN2/releases/download/v1.6-address-tunnel-b7}"
+BIGROCKET_APK="BigRocket-%s.apk"
+
+# Libraries taken from the upstream (Aether) APK: pure runtime pieces, identical for
+# both projects. libaether.so is NOT in this list: it is built here from source.
 PREBUILT_LIBS=(
     libpsiphon.so
     "libc++_shared.so"
     libandroidx.graphics.path.so
     libdatastore_shared_counter.so
+)
+
+# Libraries taken from BigRocket's own per-ABI APK (see BIGROCKET_BASE). These are the
+# engine builds this app actually links against; a copy produced by
+# scripts/build-natives.sh / build-xray.sh in the same run always wins.
+BIGROCKET_LIBS=(
+    libhev-socks5-tunnel.so
+    libxray.so
+    libaethertun.so
+    libaether.so
 )
 
 if [ "$#" -gt 0 ]; then
@@ -120,6 +139,27 @@ for abi in "${ABIS[@]}"; do
         else
             cp "$src" "$jni/$name"
             echo "    add   $name"
+        fi
+    done
+
+    # --- 1b. BigRocket's own engine libraries for this ABI -------------------------
+    # Needed on armeabi-v7a above all: upstream ships that ABI without libxray.so,
+    # libaethertun.so, and with a libhev-socks5-tunnel.so built against a different
+    # JNI contract. Skip anything this run already built from source.
+    br="$WORK/bigrocket-$abi.apk"
+    fetch "$(printf "$BIGROCKET_BASE/$BIGROCKET_APK" "$abi")" "$br" \
+        || { echo "stage-prebuilt-natives: cannot download the BigRocket $abi APK" >&2; exit 1; }
+    rm -rf "$STAGE/br-$abi"
+    unzip -o -q "$br" "lib/$abi/*" -d "$STAGE/br-$abi" \
+        || { echo "stage-prebuilt-natives: BigRocket $abi APK has no lib/$abi/" >&2; exit 1; }
+    for name in "${BIGROCKET_LIBS[@]}"; do
+        src="$STAGE/br-$abi/lib/$abi/$name"
+        [ -s "$src" ] || { echo "stage-prebuilt-natives: BigRocket $abi APK has no $name" >&2; exit 1; }
+        if [ -s "$jni/$name" ]; then
+            echo "    keep  $name (already present - produced by an earlier step)"
+        else
+            cp "$src" "$jni/$name"
+            echo "    add   $name (BigRocket $abi)"
         fi
     done
 

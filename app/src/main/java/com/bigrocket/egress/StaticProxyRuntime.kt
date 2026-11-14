@@ -161,6 +161,9 @@ object StaticProxyRuntime {
     /** True when a static proxy is configured AND its exit was confirmed. */
     fun isVerified(): Boolean = config != null && verified
 
+    /** True when a static proxy is configured and has either been verified or carried live tunnels. */
+    fun isActiveAndWorking(): Boolean = config != null && (verified || tunnelsOpened.get() > 0L)
+
     /** Called by the weight loop so the UI can show the split actually in use. */
     fun noteBondSplit(wifiPercent: Int, cellularPercent: Int) {
         val text = "$wifiPercent/$cellularPercent"

@@ -273,4 +273,11 @@
     <string name="address_tunnel_testing">Testing the address (HELLO + PING)…</string>
     <string name="address_tunnel_ok">Address tunnel: active and verified</string>
     <string name="address_tunnel_failed">Address tunnel: failed - falling back to engine 1 / direct</string>
+
+    <!-- Virtual separator engine (bit-by-bit, no server needed) -->
+    <string name="virtual_separator_title">Virtual separator engine (bit by bit - real merge, no server)</string>
+    <string name="virtual_separator_desc">Splits the HTTP stream of ONE TCP connection into concurrent slices across Wi-Fi and Cellular at the same time, then reassembles every byte in order inside the phone - so a single download or video stream gets both radios. No VPS or BridgeServer is involved, and the public IP stays the one both radios were already using.</string>
+    <string name="virtual_separator_switch">Split the payload of a single stream between both radios</string>
+    <string name="virtual_separator_status_off">Virtual separator: off</string>
+    <string name="virtual_separator_test_button">Live bit-by-bit separation and merge test</string>
 </resources>

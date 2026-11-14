@@ -19,6 +19,8 @@ import com.bigrocket.egress.StaticProxyRuntime
 import com.bigrocket.egress.StaticProxyStore
 import com.bigrocket.egress.StaticProxyParser
 import com.bigrocket.egress.VirtualEgress
+import com.bigrocket.separator.VirtualSeparatorRuntime
+import com.bigrocket.separator.VirtualSeparatorStore
 import com.bigrocket.tunnel.AddressTunnelRuntime
 import com.bigrocket.tunnel.AddressTunnelStore
 import com.bigrocket.tunnel.TunnelSpecParser
@@ -313,6 +315,7 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
         // StaticProxyRuntime directly for every new flow, so a change saved in the UI applies
         // to the next connection without tearing the tunnel down.
         StaticProxyRuntime.install(StaticProxyStore.read(this))
+        VirtualSeparatorStore.hydrate(this)
         // Address tunnel (engine 2): same policy - the saved address is re-installed on every
         // Service creation, so a Service restarted by the system still knows about it. The
         // runtime self-tests it (HELLO + PING) before claiming the egress and otherwise records
@@ -1162,6 +1165,8 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
                 path3Router.updateWeights(weights.wifiWeight, weights.cellularWeight)
                 packetRouter?.updateWeights(weights.wifiWeight, weights.cellularWeight)
                 bondingUpstream?.updateWeights(weights.wifiWeight, weights.cellularWeight)
+                PathBond.updateShare(weights.wifiWeight)
+                VirtualSeparatorRuntime.updateShare(weights.wifiWeight, weights.cellularWeight)
                 currentChainState().let { (chainMode, chainReady) ->
                     packetRouter?.setUpstreamMode(if (chainReady) chainMode else UpstreamMode.NONE)
                 }

@@ -28,6 +28,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import com.bigrocket.egress.StaticProxyRuntime
+import com.bigrocket.separator.VirtualSeparatorProbe
+import com.bigrocket.separator.VirtualSeparatorRuntime
 import com.bigrocket.service.AggregationProbe
 import com.bigrocket.service.BigRocketVpnService
 import com.bigrocket.service.PathLabels
@@ -61,6 +63,10 @@ fun LiveAggregationScreen() {
     var sharePercent by remember { mutableStateOf(50) }
     var testing by remember { mutableStateOf(false) }
     var report by remember { mutableStateOf<List<String>>(emptyList()) }
+    var separatorStatus by remember { mutableStateOf(VirtualSeparatorRuntime.status.value) }
+    var separatorTesting by remember { mutableStateOf(false) }
+    var separatorReport by remember { mutableStateOf("") }
+    var separatorProgress by remember { mutableStateOf("") }
 
     LaunchedEffect(Unit) {
         while (true) {
@@ -72,6 +78,7 @@ fun LiveAggregationScreen() {
                 cellKbps = it.kbpsNow; cellFlowCount = it.activeFlows; cellTotal = it.totalBytes
             }
             sharePercent = BigRocketVpnService.runningInstance?.currentFlowSharePercent() ?: 50
+            separatorStatus = VirtualSeparatorRuntime.status.value
             delay(1000)
         }
     }
@@ -152,10 +159,50 @@ fun LiveAggregationScreen() {
             },
             style = MaterialTheme.typography.bodySmall,
         )
+        Card {
+            Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text("موتور جداکننده مجازی (تک‌اتصال، بدون سرور)", style = MaterialTheme.typography.titleSmall)
+                Text(separatorStatus.summary(), style = MaterialTheme.typography.bodySmall)
+                if (separatorProgress.isNotEmpty()) {
+                    Text(separatorProgress, style = MaterialTheme.typography.bodySmall)
+                }
+                Button(
+                    onClick = {
+                        val service = BigRocketVpnService.runningInstance
+                        separatorTesting = true
+                        separatorReport = ""
+                        separatorProgress = "در حال اجرای تست جداسازی بیت‌به‌بیت…"
+                        scope.launch {
+                            val result = VirtualSeparatorProbe.runLiveDualRadioTest(
+                                vpnService = service,
+                                wifi = service?.sandboxWifiNetwork(),
+                                cellular = service?.sandboxCellularNetwork(),
+                            ) { separatorProgress = it }
+                            separatorReport = result.formatPersian()
+                            separatorProgress = ""
+                            separatorTesting = false
+                        }
+                    },
+                    enabled = !separatorTesting,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text(if (separatorTesting) "در حال تست جداسازی…" else "تست زنده تک‌اتصال روی دو رادیو")
+                }
+                if (separatorReport.isNotEmpty()) {
+                    Text(
+                        separatorReport,
+                        style = MaterialTheme.typography.bodySmall,
+                        fontFamily = FontFamily.Monospace,
+                    )
+                }
+            }
+        }
+
         Text(
-            "چرا یک دانلود تنها سریع‌تر نمی‌شود: یک اتصال TCP یک 4-tuple دارد و فقط از یک رادیو می‌تواند " +
-                "برود. تجمیع روی «اتصال‌های هم‌زمان» انجام می‌شود؛ مرورگر، استریم و دانلودر چند-اتصاله " +
-                "همین‌طور کار می‌کنند. برای سریع‌شدن یک اتصال واحد، طرف مقابل (موتور جداسازی) لازم است.",
+            "چرا یک دانلود تنها سریع‌تر می‌شود: با موتور جداکننده مجازی، پیلود یک اتصال واحد HTTP بین دو " +
+                "رادیو تکه‌تکه و داخل همین گوشی بازچینی می‌شود؛ پس یک دانلود یا ویدیوی تک‌اتصالی هم از هر دو " +
+                "رادیو استفاده می‌کند. برای جریان‌هایی که TLS یا پروتکل سرور-اول هستند (پورت ۴۴۳ و مشابه) " +
+                "اتصال دست‌نخورده باقی می‌ماند و تجمیع روی «اتصال‌های هم‌زمان» انجام می‌شود.",
             style = MaterialTheme.typography.bodySmall,
         )
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {

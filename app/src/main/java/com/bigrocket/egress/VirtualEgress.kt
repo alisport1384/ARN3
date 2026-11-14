@@ -2,6 +2,8 @@ package com.bigrocket.egress
 
 import android.net.Network
 import android.net.VpnService
+import com.bigrocket.separator.VirtualSeparatorRuntime
+import com.bigrocket.separator.VirtualSeparatorSocket
 import com.bigrocket.service.AppLogger
 import com.bigrocket.tunnel.AddressTunnelRuntime
 import java.io.IOException
@@ -76,11 +78,21 @@ object VirtualEgress {
 
     fun isEnabled(): Boolean = StaticProxyRuntime.config != null
 
+    /** Ports where TLS or server-first protocols always run (skip HTTP GET sniffing directly). */
+    private val NON_HTTP_PORTS = setOf(21, 22, 25, 110, 143, 443, 465, 587, 853, 993, 995, 8443)
+
     /** One-line description used in logs and the status card. */
-    fun describe(): String = when {
-        StaticProxyRuntime.config != null -> "static-proxy ${StaticProxyRuntime.config?.describe()}"
-        AddressTunnelRuntime.isReady() -> "address-tunnel ${AddressTunnelRuntime.currentSpec()?.endpointLabel()}"
-        else -> "direct"
+    fun describe(): String {
+        val base = when {
+            StaticProxyRuntime.config != null -> "static-proxy ${StaticProxyRuntime.config?.describe()}"
+            AddressTunnelRuntime.isReady() -> "address-tunnel ${AddressTunnelRuntime.currentSpec()?.endpointLabel()}"
+            else -> "direct"
+        }
+        return if (VirtualSeparatorRuntime.isEnabled() && !AddressTunnelRuntime.isReady()) {
+            "$base + virtual-separator"
+        } else {
+            base
+        }
     }
 
     /**
@@ -110,6 +122,46 @@ object VirtualEgress {
             }
             AppLogger.log("Egress", "engine 2 open failed for $destHost:$destPort - falling back")
         }
+
+        val primary = openSingleTcp(vpnService, network, destHost, destPort, connectTimeoutMs, label)
+
+        // VIRTUAL SEPARATOR ENGINE: when enabled and BOTH Wi-Fi + Cellular physical radios are up
+        // (and neither radio is pinned to 0%), wrap candidate HTTP streams in VirtualSeparatorSocket
+        // so a SINGLE download/video stream splits into concurrent slices across both radios and
+        // reassembles byte-for-byte inside the phone without needing any external BridgeServer.
+        val wifi = wifiNetwork
+        val cellular = cellularNetwork
+        val share = VirtualSeparatorRuntime.currentWifiPercent()
+        if (VirtualSeparatorRuntime.isEnabled() &&
+            wifi != null &&
+            cellular != null &&
+            wifi != cellular &&
+            share in 1..99 &&
+            destPort !in NON_HTTP_PORTS &&
+            (network == wifi || network == cellular)
+        ) {
+            val primaryIsWifi = (network == wifi)
+            return VirtualSeparatorSocket(
+                primarySocket = primary,
+                primaryIsWifi = primaryIsWifi,
+                openWorkerSocket = { useWifi, timeout ->
+                    val targetNet = if (useWifi) wifi else cellular
+                    openSingleTcp(vpnService, targetNet, destHost, destPort, timeout, "$label-vsep")
+                },
+                destLabel = "$destHost:$destPort",
+            )
+        }
+        return primary
+    }
+
+    private fun openSingleTcp(
+        vpnService: VpnService,
+        network: Network,
+        destHost: String,
+        destPort: Int,
+        connectTimeoutMs: Int,
+        label: String,
+    ): Socket {
         val configured = StaticProxyRuntime.config
         if (configured == null) {
             return connectDirect(vpnService, network, destHost, destPort, connectTimeoutMs, label)
@@ -249,7 +301,7 @@ object VirtualEgress {
         // place where a SINGLE flow can genuinely be spread over both links, one datagram each,
         // because they are independent by nature and each association is valid on its own. This
         // is the finest-grained simultaneous merge available without a remote reassembly peer.
-        if (StaticProxyRuntime.isVerified()) {
+        if (StaticProxyRuntime.isVerified() || (VirtualSeparatorRuntime.isEnabled() && StaticProxyRuntime.isActiveAndWorking())) {
             val wifi = wifiNetwork
             val cellular = cellularNetwork
             if (proxy.kind.supportsUdp && wifi != null && cellular != null) {

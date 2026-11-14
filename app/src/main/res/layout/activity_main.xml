@@ -523,6 +523,78 @@
             </LinearLayout>
         </LinearLayout>
 
+        <!-- Virtual Separator Engine (bit-by-bit, no server needed).
+             Splits ONE TCP connection's HTTP payload across Wi-Fi + Cellular
+             simultaneously and reassembles it inside the phone, so a single
+             download/video stream - not just many connections - gets both radios.
+             No external BridgeServer / VPS is involved; see com.bigrocket.separator. -->
+        <LinearLayout
+            android:id="@+id/virtualSeparatorSection"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="14dp"
+            android:background="@drawable/bg_br_card"
+            android:orientation="vertical"
+            android:padding="18dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:fontFamily="sans-serif-medium"
+                android:text="@string/virtual_separator_title"
+                android:textColor="@color/br_text_muted"
+                android:textSize="12sp" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:text="@string/virtual_separator_desc"
+                android:textColor="@color/br_text_muted"
+                android:textSize="11sp" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <androidx.appcompat.widget.SwitchCompat
+                    android:id="@+id/switchVirtualSeparator"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="@string/virtual_separator_switch"
+                    android:textAllCaps="false"
+                    android:textColor="@color/br_text_primary"
+                    android:textSize="13sp" />
+            </LinearLayout>
+
+            <TextView
+                android:id="@+id/tvVirtualSeparatorStatus"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="@string/virtual_separator_status_off"
+                android:textColor="@color/br_accent_cyan"
+                android:textSize="13sp" />
+
+            <Button
+                android:id="@+id/btnVirtualSeparatorTest"
+                android:layout_width="match_parent"
+                android:layout_height="44dp"
+                android:layout_marginTop="10dp"
+                android:background="@drawable/bg_br_button"
+                android:fontFamily="sans-serif-medium"
+                android:foreground="?android:attr/selectableItemBackground"
+                android:stateListAnimator="@null"
+                android:text="@string/virtual_separator_test_button"
+                android:textAllCaps="false"
+                android:textColor="@color/white"
+                android:textSize="14sp" />
+        </LinearLayout>
+
         <!-- Xray config: above the connect button so it can be edited and saved
              without scrolling past everything. Shown only in the modes that use
              Xray (MainActivity toggles the visibility on the mode selection). -->

@@ -173,7 +173,7 @@ class MuxSession(
         }
 
         internal fun onData(offset: Long, data: ByteArray) {
-            reorderer.offer(offset, data)
+            if (reorderer.offer(offset, data)) firstMissingSince = 0L
         }
 
         /** Called by the session after every DATA batch so a waiting FIN can complete. */
@@ -182,26 +182,58 @@ class MuxSession(
             awaitAndFinish()
         }
 
+        /**
+         * Hands every deliverable chunk to [inbound], in order.
+         *
+         * SERIALISED ON PURPOSE. With two radios this method runs concurrently on two carrier
+         * threads (one per pipe), and `Reorderer.poll()` is atomic per chunk - but an atomic
+         * poll is not enough: thread A can poll chunk N, thread B can poll chunk N+1, and then
+         * B can reach the queue first. The stream would then be delivered out of order, which
+         * is invisible for plain text and fatal for anything that checks - TLS reports
+         * "Tag mismatch" (AEAD), archives fail their CRC, video jumps backwards. Measured on
+         * the real far side: ~50% of 2 MiB https downloads corrupted before this lock existed.
+         *
+         * The lock is held across the blocking queue write on purpose: a reader that has
+         * stalled is exactly when the other carrier thread must WAIT rather than race ahead.
+         */
         internal fun drain() {
-            while (true) {
-                val chunk = reorderer.poll() ?: break
-                if (!inbound.writeBlocking(chunk, chunk.size, 30_000)) {
-                    if (inbound.isClosed) return
-                    // Reader too slow for 30 s on a 2 MiB queue: drop the flow rather than OOM.
-                    inbound.fail("stream $streamId: reader stalled")
+            synchronized(drainLock) {
+                while (true) {
+                    val chunk = reorderer.poll() ?: break
+                    if (!inbound.writeBlocking(chunk, chunk.size, 30_000)) {
+                        if (inbound.isClosed) return
+                        // Reader too slow for 30 s on a 2 MiB queue: drop the flow rather than OOM.
+                        inbound.fail("stream $streamId: reader stalled")
+                        return
+                    }
+                }
+                val missing = reorderer.firstMissing() ?: run {
+                    firstMissingSince = 0L
                     return
                 }
-            }
-            val missing = reorderer.firstMissing() ?: return
-            val now = System.currentTimeMillis()
-            if (now - lastNackAt >= NACK_INTERVAL_MS && nackTries < MAX_NACKS) {
-                lastNackAt = now
-                nackTries++
-                val length = minOf(Brt.MAX_PAYLOAD.toLong(), missing - reorderer.nextExpected()).toInt()
-                val body = Brt.intBytes(reorderer.nextExpected().toInt()) + Brt.intBytes(maxOf(1, length))
-                send(Brt.NACK, Brt.withStreamId(streamId, body))
+                // GRACE PERIOD. On two radios a "hole" is usually just a frame still in flight
+                // on the slower radio, not a loss. NACKing the instant keys[0] > consumed made
+                // every normal reordering produce a retransmission (pure waste, and over UDP a
+                // retransmission storm); waiting one RTT-ish interval costs nothing when the
+                // frame really was lost and removes almost all of that traffic.
+                val now = System.currentTimeMillis()
+                if (firstMissingSince == 0L) firstMissingSince = now
+                if (now - firstMissingSince < NACK_GRACE_MS) return
+                if (now - lastNackAt >= NACK_INTERVAL_MS && nackTries < MAX_NACKS) {
+                    lastNackAt = now
+                    nackTries++
+                    val length = minOf(Brt.MAX_PAYLOAD.toLong(), missing - reorderer.nextExpected()).toInt()
+                    val body = Brt.intBytes(reorderer.nextExpected().toInt()) + Brt.intBytes(maxOf(1, length))
+                    send(Brt.NACK, Brt.withStreamId(streamId, body))
+                }
             }
         }
+
+        /** Serialises [drain] across the (up to) two carrier threads feeding this stream. */
+        private val drainLock = Any()
+
+        /** When the current hole was first noticed; 0 = no hole. */
+        private var firstMissingSince = 0L
 
         private var lastNackAt = 0L
         private var nackTries = 0
@@ -267,6 +299,36 @@ class MuxSession(
         }
 
         override fun isClosed(): Boolean = closeSent && (markedClosed || closedByPeer.get())
+
+        // ---------------------------------------------------------------------------------
+        // Socket contract, explicitly.
+        //
+        // A MuxSocket is a fresh `Socket()` under the hood, so every inherited state
+        // accessor would answer from the base object and NOT from this stream:
+        // `isConnected()` stayed false, `getInetAddress()` null, `getPort()` 0. That is not
+        // cosmetic - `javax.net.ssl.SSLSocketFactory.createSocket(Socket, host, port, autoClose)`
+        // refuses a socket whose `isConnected()` is false, throwing
+        // "Underlying socket is not connected". In other words, WITHOUT these overrides TLS
+        // cannot be layered over the address tunnel at all (JSSE over a tunnel is the standard
+        // pattern for carrying https through a mux). Any library that asks a socket "are you
+        // really connected, and to what?" needs the truthful answer too.
+        // ---------------------------------------------------------------------------------
+
+        override fun isConnected(): Boolean = !closeSent && !closedByPeer.get()
+
+        override fun getInetAddress(): java.net.InetAddress? =
+            runCatching { java.net.InetAddress.getByName(host) }.getOrNull()
+
+        override fun getPort(): Int = port
+
+        override fun getRemoteSocketAddress(): java.net.SocketAddress =
+            java.net.InetSocketAddress(host, port)
+
+        override fun getLocalPort(): Int = 0
+
+        override fun shutdownInput() {
+            inbound.close()
+        }
 
         @Volatile private var markedClosed = false
 
@@ -649,6 +711,8 @@ class MuxSession(
         const val NACK_INTERVAL_MS = 40L
         const val MAX_NACKS = 6
         const val RESEND_CACHE = 128
+        /** How long a hole may exist before a NACK is worth sending (transient reordering is normal). */
+        const val NACK_GRACE_MS = 60L
         const val MAX_QUEUED_DATAGRAMS = 64
     }
 }

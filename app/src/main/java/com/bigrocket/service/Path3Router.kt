@@ -4,6 +4,7 @@ import android.net.Network
 import com.bigrocket.egress.PathBond
 import com.bigrocket.egress.PathBondAllocator
 import com.bigrocket.egress.StaticProxyRuntime
+import com.bigrocket.separator.VirtualSeparatorRuntime
 
 /**
  * The single logical Path 3 output of BigRocket.
@@ -54,12 +55,15 @@ class Path3Router : PathSelector {
         // alternating at equal scores (simultaneous bit-for-bit merge), proportional when one
         // score is higher. The score/latency/identity rules below are skipped entirely: that is
         // what "no IP selection by score or by quality (on equal scores)" means in practice.
-        if (wifi != null && cellular != null && StaticProxyRuntime.isVerified()) {
-            // Real aggregation across flows (no server, no simulation): the exit IP is fixed by
-            // the verified proxy, so every new flow may take either radio. The split starts from
-            // the score ratio (strict alternation at equal scores) and is then corrected by the
-            // MEASURED throughput of each radio and by how many flows are already in flight -
-            // that is what keeps a saturated radio from collecting every new connection.
+        if (wifi != null && cellular != null &&
+            (StaticProxyRuntime.isVerified() || VirtualSeparatorRuntime.isEnabled())
+        ) {
+            // Real aggregation across flows (no server, no simulation): both links act as one
+            // bandwidth pool. Previously BondingSocksServer passed slot=null and fell into
+            // `else -> wifi` whenever no verified static proxy was set, leaving Cellular at 0%!
+            // Now with VirtualSeparatorRuntime enabled (or verified static proxy), every new flow
+            // uses Bresenham interleaving (PathBond) + EWMA radio throughput & active-flow
+            // crowding correction (FlowBalancer) so both radios share traffic simultaneously.
             val samples = PathTrafficStats.tick()
             val wifiKbps = samples.firstOrNull { it.label == PathLabels.WIFI }?.kbpsNow ?: 0
             val cellKbps = samples.firstOrNull { it.label == PathLabels.CELLULAR }?.kbpsNow ?: 0

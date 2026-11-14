@@ -374,6 +374,16 @@ class BondedEndpoint(
     /** Pipes that are actually up (1 while only one radio has a route). */
     fun liveCount(): Int = endpoints.count { it.isOpen }
 
+    /**
+     * Tears down one pipe (radio lost its route) without touching the others. [send] already
+     * fails over to the surviving pipe, so a download in flight must continue byte-for-byte.
+     */
+    fun killPipe(index: Int) {
+        val endpoint = endpoints.getOrNull(index) ?: return
+        AppLog.info("carrier", "bonded carrier: dropping pipe ${endpoint.label}")
+        runCatching { endpoint.close() }
+    }
+
     override fun start(sink: FrameSink): Boolean {
         var ok = false
         // One shared sink: whichever radio a frame arrives on, it lands in the same mux.

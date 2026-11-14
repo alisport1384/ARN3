@@ -276,4 +276,11 @@
     <string name="address_tunnel_testing">در حال تست آدرس (HELLO + PING)…</string>
     <string name="address_tunnel_ok">تونل آدرسی: فعال و تأییدشده</string>
     <string name="address_tunnel_failed">تونل آدرسی: ناموفق — برگشت به موتور ۱ / مستقیم</string>
+
+    <!-- موتور جداکننده مجازی (بیت‌به‌بیت، بدون سرور) -->
+    <string name="virtual_separator_title">موتور جداکننده مجازی (بیت‌به‌بیت — ادغام واقعی بدون سرور)</string>
+    <string name="virtual_separator_desc">پیلود یک اتصال واحد HTTP را هم‌زمان بین وای‌فای و دیتای موبایل تکه‌تکه می‌کند و همان بایت‌ها را به ترتیب درون گوشی بازچینی می‌کند؛ پس یک دانلود یا پخش ویدیوی تک‌اتصالی هم از هر دو رادیو استفاده می‌کند. هیچ VPS یا BridgeServer لازم نیست و آی‌پی عمومی همان آی‌پی دو مسیر است.</string>
+    <string name="virtual_separator_switch">تفکیک پیلود یک جریان بین دو رادیو</string>
+    <string name="virtual_separator_status_off">جداکننده مجازی: خاموش</string>
+    <string name="virtual_separator_test_button">تست زنده جداسازی و ادغام بیت‌به‌بیت</string>
 </resources>
