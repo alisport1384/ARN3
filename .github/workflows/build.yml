@@ -232,7 +232,19 @@ jobs:
           NOTES="$(cat <<NOTES_EOF
           BigRocket ${VERSION} (versionCode ${CODE}) - address tunnel.
 
-          PSIPHON IS NOW AVAILABLE IN THE Direct + Xray MODE, not only Direct + Aether.
+          FIXED: Xray WOULD NOT CONNECT THROUGH PSIPHON (broken since the stage was
+          added in b9). The config written for the standalone Psiphon client omitted
+          PropagationChannelId and SponsorId, which psiphon-tunnel-core requires -
+          the client exited before opening its listener, so Direct + Xray never left
+          through Psiphon. The config now mirrors the Aether engine's working
+          launcher field for field (identity, remote server list + signature key,
+          TCP-only chained protocols), the config file keeps owner-only permissions
+          instead of being unreadable to the client itself, the client gets a CA
+          store (SSL_CERT_DIR), and the stage is only called ready once it reports
+          a real tunnel - not merely an open socket. Full detail, in Persian:
+          docs/PsiphonXrayFix-fa.md.
+
+          PSIPHON IN THE Direct + Xray MODE (from b9):
           Xray's core has no --psiphon switch, so the hop is a standalone libpsiphon.so
           listening on 127.0.0.1:1821 as the ENTRY of the chain and dialling Xray on :1839
           through UpstreamProxyURL:

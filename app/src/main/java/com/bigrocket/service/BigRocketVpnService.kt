@@ -347,9 +347,21 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
             combine(
                 EmbeddedAetherRuntime.trafficReady,
                 EmbeddedXrayRuntime.trafficReady,
-            ) { aetherReady, xrayReady -> aetherReady to xrayReady }
-                .collectLatest { (aetherReady, xrayReady) ->
+                XrayPsiphonHop.ready,
+            ) { aetherReady, xrayReady, psiphonReady -> Triple(aetherReady, xrayReady, psiphonReady) }
+                .collectLatest { (aetherReady, xrayReady, psiphonReady) ->
                     onChainReadinessChanged(aetherReady, xrayReady)
+                    // The Xray-chain Psiphon stage publishes readiness only once
+                    // it has a real tunnel (XrayPsiphonHop.ready); the chain
+                    // entry may move to the client's port (1821) only then, and
+                    // must move back the moment the stage goes away.
+                    if (psiphonReady && !AetherEntry.xrayPsiphonLive) {
+                        AetherEntry.updateXrayPsiphon(true)
+                        refreshUpstreamModeForEntryChange()
+                    } else if (!psiphonReady && AetherEntry.xrayPsiphonLive) {
+                        AetherEntry.updateXrayPsiphon(false)
+                        refreshUpstreamModeForEntryChange()
+                    }
                 }
         }
     }

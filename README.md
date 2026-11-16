@@ -36,7 +36,7 @@ single TLS stream, 2048 KiB: 1 radio = 8.05 Mbps (2084ms),
 ## Building
 
 ```bash
-./gradlew :app:testDebugUnitTest -PbrAbis=armeabi-v7a      # 26 suites / 226 tests
+./gradlew :app:testDebugUnitTest -PbrAbis=armeabi-v7a      # 26 suites / 231 tests
 ./gradlew :app:assembleRelease    -PbrAbis=arm64-v8a,armeabi-v7a
 ```
 

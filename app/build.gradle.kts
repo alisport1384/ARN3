@@ -25,7 +25,7 @@ android {
         targetSdk = 37
         // Bumped so a new build always upgrades an older install cleanly (an identical
         // versionCode makes some installers refuse with "App not installed").
-        versionCode = 9
+        versionCode = 10
         versionName = "1.6-address-tunnel"
         buildConfigField("String", "CORE_VERSION", "\"embedded-aether\"")
         multiDexEnabled = true

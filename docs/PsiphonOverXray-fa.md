@@ -179,10 +179,16 @@ stage-prebuilt-natives: cannot download the BigRocket arm64-v8a APK
 
 ## وضعیت این نسخه
 
+> **به‌روزرسانی b10:** در نسخهٔ ۹ این مرحله روی دستگاه هرگز بالا نمی‌آمد — کانفیگ
+> کلاینت دو فیلد اجباری `PropagationChannelId` و `SponsorId` را نداشت و کلاینت قبل
+> از باز کردن لیستنر خارج می‌شد. ریشه‌یابی کامل و اصلاح در
+> [`PsiphonXrayFix-fa.md`](PsiphonXrayFix-fa.md) و یادداشت‌های ریلیز در
+> [`RELEASE-1.6-address-tunnel-b10.md`](RELEASE-1.6-address-tunnel-b10.md).
+
 | | |
 |---|---|
-| نسخه | `1.6-address-tunnel` / versionCode **9** (تگ `v1.6-address-tunnel-b9`) |
-| تست‌ها | **۲۶ سوئیت / ۲۲۶ تست / ۰ خطا** (۱۱ تست سایفون + ۳ تست تعمیر تونل تازه‌اند) |
+| نسخه | `1.6-address-tunnel` / versionCode **10** (تگ `v1.6-address-tunnel-b10`) |
+| تست‌ها | **۲۶ سوئیت / ۲۳۱ تست / ۰ خطا** (۱۶ تست سایفون در `XrayPsiphonHopTest`) |
 | CI | همهٔ مراحل سبز، شامل ساخت هر دو ABI و انتشار ریلیز |
 | امضا | `CN=BigRocket` — روی نسخهٔ قبلی نصب می‌شود، نیازی به حذف برنامهٔ قبلی نیست |
 

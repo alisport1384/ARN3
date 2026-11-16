@@ -141,6 +141,104 @@ class XrayPsiphonHopTest {
         }
     }
 
+    // -------------------------------------------------------------------------------------
+    // 4. the fields psiphon-tunnel-core refuses to start without
+    //
+    // Regression suite for the field failure "Xray does not connect to Psiphon": the
+    // generated config omitted PropagationChannelId/SponsorId, which Config.Commit()
+    // requires, so the console client exited before opening its listener and the hop
+    // could never become ready. The field set mirrors the Aether engine's working
+    // launcher (native/aether/aether/src/psiphon.rs::build_config, chained shape).
+    // -------------------------------------------------------------------------------------
+
+    @Test
+    fun `the required distribution identity is always present`() {
+        val json = config()
+        assertEquals(XrayPsiphonHop.PROPAGATION_CHANNEL_ID, json.getString("PropagationChannelId"))
+        assertEquals(XrayPsiphonHop.SPONSOR_ID, json.getString("SponsorId"))
+        assertTrue(json.getString("PropagationChannelId").isNotEmpty())
+        assertTrue(json.getString("SponsorId").isNotEmpty())
+        assertEquals(XrayPsiphonHop.CLIENT_PLATFORM, json.getString("ClientPlatform"))
+        // ClientVersion must stay an integer string: Commit() parses it with Atoi.
+        assertEquals(XrayPsiphonHop.CLIENT_VERSION, json.getString("ClientVersion"))
+        json.getString("ClientVersion").toInt()
+    }
+
+    @Test
+    fun `the remote server list carries its signature key`() {
+        // Commit() rejects a RemoteServerListURLs that has no signature public key.
+        val json = config()
+        val urls = json.getJSONArray("RemoteServerListURLs")
+        assertEquals(1, urls.length())
+        val decoded = String(
+            java.util.Base64.getDecoder().decode(urls.getJSONObject(0).getString("URL")),
+            Charsets.UTF_8,
+        )
+        assertEquals(
+            "https://s3.amazonaws.com//psiphon/web/mjr4-p23r-puwl/server_list_compressed",
+            decoded,
+        )
+        assertTrue(json.getString("RemoteServerListSignaturePublicKey").length > 100)
+    }
+
+    @Test
+    fun `only tcp protocols are offered through the socks upstream`() {
+        // QUIC/INPROXY protocols need UDP, which cannot cross the SOCKS5 hop to
+        // Xray; offering them only burns workers on dials that can never succeed.
+        val offered = config().getJSONArray("LimitTunnelProtocols")
+        assertTrue(offered.length() > 0)
+        for (i in 0 until offered.length()) {
+            val name = offered.getString(i)
+            assertFalse("$name carries UDP", name.contains("QUIC"))
+            assertFalse("$name carries UDP", name.startsWith("INPROXY"))
+        }
+        assertTrue(config().getBoolean("DisableTactics"))
+    }
+
+    @Test
+    fun `notice parsing finds the tunnel and the listener`() {
+        assertEquals(
+            1,
+            XrayPsiphonHop.noticeTunnelCount("""{"noticeType":"Tunnels","data":{"count":1}}"""),
+        )
+        assertEquals(
+            0,
+            XrayPsiphonHop.noticeTunnelCount("""{"noticeType":"Tunnels","data":{"count":0}}"""),
+        )
+        assertNull(XrayPsiphonHop.noticeTunnelCount("""{"noticeType":"Info","data":{"message":"x"}}"""))
+        assertEquals(
+            1821,
+            XrayPsiphonHop.noticeSocksPort("""{"noticeType":"ListeningSocksProxyPort","data":{"port":1821}}"""),
+        )
+        assertNull(XrayPsiphonHop.noticeSocksPort("""{"noticeType":"Tunnels","data":{"count":1}}"""))
+    }
+
+    @Test
+    fun `the ca store mirrors the engine selection`() {
+        // A preset store is always respected (null = inherit).
+        assertNull(
+            XrayPsiphonHop.caStoreEnv(preset = true, prefix = null, fileExists = { true }, dirExists = { true }),
+        )
+        // First existing file wins, exactly like psiphon.rs::ca_store_env.
+        assertEquals(
+            "SSL_CERT_FILE" to "/etc/ssl/certs/ca-certificates.crt",
+            XrayPsiphonHop.caStoreEnv(
+                preset = false,
+                prefix = null,
+                fileExists = { it == "/etc/ssl/certs/ca-certificates.crt" },
+                dirExists = { true },
+            ),
+        )
+        // Android fallback: the platform cacerts directories.
+        assertEquals(
+            "SSL_CERT_DIR" to "/system/etc/security/cacerts:/apex/com.android.conscrypt/cacerts",
+            XrayPsiphonHop.caStoreEnv(preset = false, prefix = null, fileExists = { false }, dirExists = { true }),
+        )
+        assertNull(
+            XrayPsiphonHop.caStoreEnv(preset = false, prefix = null, fileExists = { false }, dirExists = { false }),
+        )
+    }
+
     @Test
     fun `the config is valid json with no trailing comma`() {
         // A trailing comma makes the Go parser reject the whole file, and the client then
